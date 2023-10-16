@@ -446,7 +446,7 @@ def MS_chunk_to_zarr(xds, MeasurementSet_chunk, time, time_indices, baseline_ant
 # Chunk tuning required for optimal performance
 # Dask recommends at least 100MB chunk sizes
 # https://docs.dask.org/en/latest/array-best-practices.html
-def rechunk(outfile_tmp, outfile):
+def rechunk(outfile_tmp, outfile, compress):
     
     xds = xr.open_zarr(outfile_tmp)
     
@@ -454,6 +454,11 @@ def rechunk(outfile_tmp, outfile):
     # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
     for var in xds:
         del xds[var].encoding['chunks']
+            
+    # Compression slows down the conversion a lot
+    if compress:
+        compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
+        add_encoding(xds_base, compressor)
         
     # Chunks method is number of pieces in the chunk
     # not the number of chunks. -1 gives a single chunk
@@ -499,11 +504,6 @@ def convert(infile, outfile, compress=True):
         print(f'Number of loops {len(unique_time_values)}')
         print(0)
         MS_chunk_to_zarr(xds_base.copy(deep=True), MeasurementSet.query('TIME == $unique_time_values[0]'), unique_time_values[0], time_indices, baseline_ant1_id, baseline_ant2_id, column_names, outfile_tmp, append=False)
-    
-        # Compression slows down the conversion a lot
-        if compress:
-            compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-            add_encoding(xds_base, compressor)
             
         # delayed_conversions = []
         
@@ -514,5 +514,5 @@ def convert(infile, outfile, compress=True):
             # delayed_conversions.append(dask.delayed(MS_chunk_to_zarr(xds_base.copy(deep=True), MeasurementSet.query('TIME == $time'), time, time_indices, baseline_ant1_id, baseline_ant2_id, column_names, outfile_tmp, append=True)))
             
         # dask.compute(delayed_conversions)
-        rechunk(outfile_tmp, outfile)
+        rechunk(outfile_tmp, outfile, compress)
         
