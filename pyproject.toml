@@ -1,0 +1,21 @@
+[project]
+name = 'msconverter'
+version = '0.0.1'
+description = 'MeasurementSet to xarray converter'
+authors = [
+    {name = 'Sean Stansill', email='sean.stansill@nag.com'},
+]
+license = {file = 'LICENSE'}
+readme = 'README.md'
+requires-python = '>=3.8, <3.12'
+
+dependencies = [
+'numpy',
+'xarray',
+'dask',
+'pytest',
+'zarr',
+'numcodecs',
+'jupyterlab',
+'python_casacore>=3.5.2; sys_platform != "darwin" '
+]
