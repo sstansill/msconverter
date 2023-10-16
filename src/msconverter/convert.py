@@ -458,7 +458,7 @@ def rechunk(outfile_tmp, outfile, compress):
     # Compression slows down the conversion a lot
     if compress:
         compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
-        add_encoding(xds_base, compressor)
+        add_encoding(xds, compressor)
         
     # Chunks method is number of pieces in the chunk
     # not the number of chunks. -1 gives a single chunk
