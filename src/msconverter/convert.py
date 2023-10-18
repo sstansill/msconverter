@@ -346,7 +346,6 @@ def MS_chunk_to_zarr(
     xds,
     MeasurementSet_chunk,
     time,
-    time_indices,
     baseline_ant1_id,
     baseline_ant2_id,
     column_names,
@@ -485,10 +484,8 @@ def convert(infile, outfile, compress=True):
         field_id = _check_single_field(MeasurementSet)
 
         # Get the unique timestamps
-        unique_time_values = np.unique(MeasurementSet.getcol("TIME"))
-        time_indices = range(
-            len(unique_time_values)
-        )  # np.searchsorted(unique_time_values, MeasurementSet.getcol('TIME'))
+        time_values = MeasurementSet.getcol("TIME").flatten()
+        unique_time_values = np.unique(time_values)
 
         # Get unique baseline indices
         baseline_ant1_id, baseline_ant2_id = get_baseline_indices(MeasurementSet)
@@ -504,34 +501,17 @@ def convert(infile, outfile, compress=True):
 
         column_names = MeasurementSet.colnames()
 
-        # Do the first iteration outside the loop to ensure data is overwritten
-        # append_dim cannot be used for the creation of the zarr store
-        MS_chunk_to_zarr(
-            xds_base.copy(deep=True),
-            MeasurementSet.query("TIME == $unique_time_values[0]"),
-            unique_time_values[0],
-            time_indices,
-            baseline_ant1_id,
-            baseline_ant2_id,
-            column_names,
-            outfile_tmp,
-            append=False,
-        )
-
-        # delayed_conversions = []
-
         # The xarray Dataset for each time value will become a Zarr chunk
-        for time in tqdm(unique_time_values[1:], desc="Converting to Zarr", unit="time values"):
+        for time in tqdm(unique_time_values, desc="Converting to Zarr", unit="time values"):
             MS_chunk_to_zarr(
                 xds_base.copy(deep=True),
-                MeasurementSet.query("TIME == $time"),
+                MeasurementSet.selectrows(np.where(time_values == time)[0]),
                 time,
-                time_indices,
                 baseline_ant1_id,
                 baseline_ant2_id,
                 column_names,
                 outfile_tmp,
-                append=True,
+                append=(time != unique_time_values[0]),
             )
             # delayed_conversions.append(dask.delayed(MS_chunk_to_zarr(xds_base.copy(deep=True), MeasurementSet.query('TIME == $time'), time, time_indices, baseline_ant1_id, baseline_ant2_id, column_names, outfile_tmp, append=True)))
 
