@@ -4,6 +4,7 @@ import xarray as xr
 from numcodecs import Blosc
 import dask.array as da
 import shutil
+from tqdm import tqdm
 
 
 # Named data variables (ie data)
@@ -505,8 +506,6 @@ def convert(infile, outfile, compress=True):
 
         # Do the first iteration outside the loop to ensure data is overwritten
         # append_dim cannot be used for the creation of the zarr store
-        print(f"Number of loops {len(unique_time_values)}")
-        print(0)
         MS_chunk_to_zarr(
             xds_base.copy(deep=True),
             MeasurementSet.query("TIME == $unique_time_values[0]"),
@@ -522,8 +521,7 @@ def convert(infile, outfile, compress=True):
         # delayed_conversions = []
 
         # The xarray Dataset for each time value will become a Zarr chunk
-        for i, time in enumerate(unique_time_values[1:]):
-            print(i + 1)
+        for time in tqdm(unique_time_values[1:], desc="Converting to Zarr", unit="time values"):
             MS_chunk_to_zarr(
                 xds_base.copy(deep=True),
                 MeasurementSet.query("TIME == $time"),
