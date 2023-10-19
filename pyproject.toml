@@ -17,6 +17,6 @@ dependencies = [
 'zarr',
 'numcodecs',
 'jupyterlab',
+'tqdm',
 'python_casacore>=3.5.2; sys_platform != "darwin" '
-'tqdm'
 ]
