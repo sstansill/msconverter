@@ -5,6 +5,8 @@ from numcodecs import Blosc
 import dask.array as da
 import shutil
 from tqdm import tqdm
+import os
+import dask
 
 
 # Named data variables (ie data)
@@ -102,6 +104,19 @@ stokes_types = {
 }
 
 
+
+def get_dir_size(path='.'):
+    total = 0
+    with os.scandir(path) as it:
+        for entry in it:
+            if entry.is_file():
+                total += entry.stat().st_size
+            elif entry.is_dir():
+                total += get_dir_size(entry.path)
+    return total
+
+
+
 # Check that the time steps have a single unique value
 def _check_interval_consistent(MeasurementSet):
     time_interval = np.unique(MeasurementSet.getcol("INTERVAL"))
@@ -124,7 +139,7 @@ def _check_single_field(MeasurementSet):
 
 
 # Create the DataArray coordinates and add various metadata
-def create_coordinates(xds, MeasurementSet, baseline_ant1_id, baseline_ant2_id):
+def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, baseline_ant2_id, fits_in_memory):
     ###############################################################
     # Add metadata
     ###############################################################
@@ -171,19 +186,21 @@ def create_coordinates(xds, MeasurementSet, baseline_ant1_id, baseline_ant2_id):
         # "reference_direction": reference_direction,
         "field_id": field_id,
     }
-    xds.attrs["field_info"] = field_info
+    # xds.attrs["field_info"] = field_info
 
     ###############################################################
     # Add coordinates
     ###############################################################
 
     coords = {
-        # Ignore time because we populate this 'on the fly'
-        # 'time': unique_times,
         "baseline_antenna1_id": ("baseline_id", baseline_ant1_id),
         "baseline_antenna2_id": ("baseline_id", baseline_ant2_id),
         "baseline_id": np.arange(len(baseline_ant1_id)),
     }
+    
+    # If it doesn't fit in memory, populate time coordinate on-the-fly
+    if fits_in_memory:
+        coords["time"] = unique_times
 
     # Add frequency coordinates
     frequencies = MeasurementSet.SPECTRAL_WINDOW[0].get("CHAN_FREQ", [])
@@ -233,7 +250,6 @@ def reshape_column(
     column_data: np.ndarray,
     cshape: tuple[int],
     time_indices: np.ndarray,
-    time,
     baselines: np.ndarray,
 ):
     # full data is the maximum of the data shape and chunk shape dimensions for each time interval
@@ -387,7 +403,6 @@ def MS_chunk_to_zarr(
                         data,
                         data_shape,
                         time_indices,
-                        time,
                         baseline_indices,
                     )
 
@@ -406,7 +421,6 @@ def MS_chunk_to_zarr(
                     column_data,
                     data_shape,
                     time_indices,
-                    time,
                     baseline_indices,
                 )
 
@@ -441,16 +455,135 @@ def MS_chunk_to_zarr(
     # Each time value is a new chunk
     # Not clear is there's a way to change this behaviour
     if append:
-        xds.to_zarr(store=outfile, append_dim="time", consolidated=True)
+        xds.to_zarr(store=outfile, append_dim="time")
     else:
         add_time(xds, MeasurementSet_chunk)
-        xds.to_zarr(store=outfile, mode="w", consolidated=True)
+        xds.to_zarr(store=outfile, mode="w")
+
+
+def MS_to_zarr_in_memory(
+    xds,
+    MeasurementSet,
+    unique_times,
+    baseline_ant1_id,
+    baseline_ant2_id,
+    column_names,
+    infile,
+    outfile,
+    compress,
+    append,
+):
+    # Get all baseline pairs
+    antenna1, antenna2 = (
+        MeasurementSet.getcol("ANTENNA1"),
+        MeasurementSet.getcol("ANTENNA2"),
+    )
+
+    # Get dimensions of data
+    time_indices = np.searchsorted(unique_times, MeasurementSet.getcol("TIME"))
+    data_shape = (len(unique_times), len(baseline_ant1_id))
+
+    baseline_combinations = [
+        str(ll[0]).zfill(3) + "_" + str(ll[1]).zfill(3)
+        for ll in np.hstack([antenna1[:, None], antenna2[:, None]])
+    ]
+
+    baselines = get_baselines(MeasurementSet)
+
+    baseline_indices = np.searchsorted(baselines, baseline_combinations)
+
+    # Must loop over each column to create an xarray DataArray for each
+    for column_name in column_names:
+        # Only handle certain columns. Others are metadata/coordinates
+        if column_name in data_variable_columns:
+            column_data = MeasurementSet.getcol(column_name)
+
+            # UVW column must be split into u, v, and w
+            if column_name == "UVW":
+                subcolumns = [column_data[:, 0], column_data[:, 1], column_data[:, 2]]
+                subcolumn_names = ["U", "V", "W"]
+
+                for data, name in zip(subcolumns, subcolumn_names):
+                    reshaped_column = reshape_column(
+                        data,
+                        data_shape,
+                        time_indices,
+                        baseline_indices,
+                    )
+
+                    # Create a DataArray instead of appending immediately to Dataset
+                    # so time coordinates can be updated
+                    xda = xr.DataArray(
+                        reshaped_column,
+                        dims=column_dimensions.get(name),
+                    )
+
+                    # Add the DataArray to the Dataset
+                    xds[column_to_data_variable_names.get(name)] = xda
+
+            else:
+                reshaped_column = reshape_column(
+                    column_data,
+                    data_shape,
+                    time_indices,
+                    baseline_indices,
+                )
+
+                # Create a DataArray instead of appending immediately to Dataset
+                # so time coordinates can be updated
+                xda = xr.DataArray(
+                    reshaped_column,
+                    dims=column_dimensions.get(column_name),
+                )
+
+                # Add the DataArray to the Dataset
+                xds[column_to_data_variable_names.get(column_name)] = xda
+
+    # Add column metadata at the end
+    # Adding metadata to a variable means the variable must already exist
+    if not append:
+        for column_name in column_names:
+            if column_name in data_variable_columns:
+                if column_name == "UVW":
+                    subcolumn_names = ["U", "V", "W"]
+
+                    for subcolumn_name in subcolumn_names:
+                        xds[column_to_data_variable_names[subcolumn_name]].attrs.update(
+                            create_attribute_metadata(column_name, MeasurementSet)
+                        )
+
+                else:
+                    xds[column_to_data_variable_names[column_name]].attrs.update(
+                        create_attribute_metadata(column_name, MeasurementSet)
+                    )
+        
+    if compress:
+        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+        add_encoding(xds, compressor)
+        
+    MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    
+    # Ceiling division so that chunks are at least 100MB
+    # Integer casting always returns a smaller number so chunks >100MB
+    n_chunks = MS_size_MB // 100
+    
+    ntimes = len(unique_times)
+
+    # xr's chunk method requires rows_per_chunk as input not n_chunks
+    times_per_chunk = 2 * ntimes // n_chunks
+
+    # Chunks method is number of pieces in the chunk
+    # not the number of chunks. -1 gives a single chunk
+    xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
+        
+    dask.compute(xds.to_zarr(store=outfile, mode="w", compute = False))
+    
 
 
 # Chunk tuning required for optimal performance
 # Dask recommends at least 100MB chunk sizes
 # https://docs.dask.org/en/latest/array-best-practices.html
-def rechunk(outfile_tmp, outfile, compress):
+def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
     xds = xr.open_zarr(outfile_tmp)
 
     # Manually delete encoding otherwise to_zarr() fails
@@ -462,22 +595,30 @@ def rechunk(outfile_tmp, outfile, compress):
     if compress:
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
         add_encoding(xds, compressor)
+        
+    MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    
+    # Ceiling division so that chunks are at least 100MB
+    # Integer casting always returns a smaller number so chunks >100MB
+    n_chunks = MS_size_MB // 100
+
+    # xr's chunk method requires rows_per_chunk as input not n_chunks
+    times_per_chunk = 2 * ntimes // n_chunks
 
     # Chunks method is number of pieces in the chunk
     # not the number of chunks. -1 gives a single chunk
-    # xds = xds.chunk({'time': -1})
-    xds = xds.chunk({"time": 100})
+    xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
     xds.to_zarr(outfile, mode="w", compute=True, consolidated=True)
 
     shutil.rmtree(f"{outfile_tmp}")
 
 
-def convert(infile, outfile, compress=True):
+def convert(infile, outfile, compress=True, fits_in_memory=False):
     # Create temporary zarr store
     # Eventually clean-up by rechunking the zarr datastore
     outfile_tmp = outfile + ".tmp"
 
-    with tables.table(infile) as MeasurementSet:
+    with tables.table(infile, readonly=True, lockoptions='autonoread') as MeasurementSet:
         # Initial checks
         time_interval = _check_interval_consistent(MeasurementSet)
         exposure_time = _check_exposure_consistent(MeasurementSet)
@@ -496,24 +637,39 @@ def convert(infile, outfile, compress=True):
         # Add dimensions, coordinates and attributes here to prevent
         # repetition. Deep copy made for each loop iteration
         xds_base = create_coordinates(
-            xds_base, MeasurementSet, baseline_ant1_id, baseline_ant2_id
+            xds_base, MeasurementSet, unique_time_values, baseline_ant1_id, baseline_ant2_id, fits_in_memory
         )
 
         column_names = MeasurementSet.colnames()
 
-        # The xarray Dataset for each time value will become a Zarr chunk
-        for time in tqdm(unique_time_values, desc="Converting to Zarr", unit="time values"):
-            MS_chunk_to_zarr(
-                xds_base.copy(deep=True),
-                MeasurementSet.selectrows(np.where(time_values == time)[0]),
-                time,
+        if fits_in_memory:
+            MS_to_zarr_in_memory(
+                xds_base,
+                MeasurementSet,
+                unique_time_values,
                 baseline_ant1_id,
                 baseline_ant2_id,
                 column_names,
-                outfile_tmp,
-                append=(time != unique_time_values[0]),
+                infile,
+                outfile,
+                compress,
+                append=False,
             )
-            # delayed_conversions.append(dask.delayed(MS_chunk_to_zarr(xds_base.copy(deep=True), MeasurementSet.query('TIME == $time'), time, time_indices, baseline_ant1_id, baseline_ant2_id, column_names, outfile_tmp, append=True)))
-
-        # dask.compute(delayed_conversions)
-        rechunk(outfile_tmp, outfile, compress)
+            
+        else:
+            # The xarray Dataset for each time value will become a Zarr chunk
+            # TODO change each unique time to a list of times with np.split()
+            # required flag for number of splits
+            for time in tqdm(unique_time_values, desc="Converting to Zarr", unit="time values"):
+                MS_chunk_to_zarr(
+                    xds_base.copy(deep=True),
+                    MeasurementSet.selectrows(np.where(time_values == time)[0]),
+                    time,
+                    baseline_ant1_id,
+                    baseline_ant2_id,
+                    column_names,
+                    outfile_tmp,
+                    append=(time != unique_time_values[0]),
+                )
+        
+            rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
