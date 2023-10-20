@@ -576,7 +576,7 @@ def MS_to_zarr_in_memory(
     # not the number of chunks. -1 gives a single chunk
     xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
         
-    dask.compute(xds.to_zarr(store=outfile, mode="w", compute = False))
+    return xds.to_zarr(store=outfile, mode="w", compute = False)
     
 
 
@@ -657,19 +657,38 @@ def convert(infile, outfile, compress=True, fits_in_memory=False):
             )
             
         else:
-            # The xarray Dataset for each time value will become a Zarr chunk
-            # TODO change each unique time to a list of times with np.split()
-            # required flag for number of splits
-            for time in tqdm(unique_time_values, desc="Converting to Zarr", unit="time values"):
-                MS_chunk_to_zarr(
+            
+            dask_jobs = []
+
+            MS_chunk_to_zarr(
                     xds_base.copy(deep=True),
-                    MeasurementSet.selectrows(np.where(time_values == time)[0]),
-                    time,
+                    MeasurementSet.selectrows(np.where(time_values == unique_time_values[0])[0]),
+                    unique_time_values[0],
                     baseline_ant1_id,
                     baseline_ant2_id,
                     column_names,
                     outfile_tmp,
-                    append=(time != unique_time_values[0]),
+                    append=False,
                 )
+            
+            # The xarray Dataset for each time value will become a Zarr chunk
+            for i, time in enumerate(unique_time_values):
+                if i == 0:
+                    continue
+                    
+                else:
+                    dask_jobs.append(
+                        MS_chunk_to_zarr(
+                            xds_base.copy(deep=True),
+                            MeasurementSet.selectrows(np.where(time_values == time)[0]),
+                            time,
+                            baseline_ant1_id,
+                            baseline_ant2_id,
+                            column_names,
+                            outfile_tmp,
+                            append=True),
+                        )
+
+            dask.compute(dask_jobs)
         
             rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
