@@ -361,7 +361,7 @@ def add_time(xds, MeasurementSet):
 def MS_chunk_to_zarr(
     xds,
     MeasurementSet_chunk,
-    time,
+    times,
     baseline_ant1_id,
     baseline_ant2_id,
     column_names,
@@ -375,8 +375,8 @@ def MS_chunk_to_zarr(
     )
 
     # Get dimensions of data
-    time_indices = np.searchsorted([time], MeasurementSet_chunk.getcol("TIME"))
-    data_shape = (1, len(baseline_ant1_id))
+    time_indices = np.searchsorted(times, MeasurementSet_chunk.getcol("TIME"))
+    data_shape = (len(times), len(baseline_ant1_id))
 
     baseline_combinations = [
         str(ll[0]).zfill(3) + "_" + str(ll[1]).zfill(3)
@@ -411,7 +411,7 @@ def MS_chunk_to_zarr(
                     xda = xr.DataArray(
                         reshaped_column,
                         dims=column_dimensions.get(name),
-                    ).assign_coords(time=("time", [time]))
+                    ).assign_coords(time=("time", times))
 
                     # Add the DataArray to the Dataset
                     xds[column_to_data_variable_names.get(name)] = xda
@@ -429,7 +429,7 @@ def MS_chunk_to_zarr(
                 xda = xr.DataArray(
                     reshaped_column,
                     dims=column_dimensions.get(column_name),
-                ).assign_coords(time=("time", [time]))
+                ).assign_coords(time=("time", times))
 
                 # Add the DataArray to the Dataset
                 xds[column_to_data_variable_names.get(column_name)] = xda
@@ -455,10 +455,10 @@ def MS_chunk_to_zarr(
     # Each time value is a new chunk
     # Not clear is there's a way to change this behaviour
     if append:
-        xds.to_zarr(store=outfile, append_dim="time")
+        return xds.to_zarr(store=outfile, append_dim="time", compute=True)
     else:
         add_time(xds, MeasurementSet_chunk)
-        xds.to_zarr(store=outfile, mode="w")
+        xds.to_zarr(store=outfile, mode="w", compute=True)
 
 
 def MS_to_zarr_in_memory(
@@ -576,7 +576,7 @@ def MS_to_zarr_in_memory(
     # not the number of chunks. -1 gives a single chunk
     xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
         
-    return xds.to_zarr(store=outfile, mode="w", compute = False)
+    return xds.to_zarr(store=outfile, mode="w", compute=True)
     
 
 
@@ -603,7 +603,7 @@ def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
     n_chunks = MS_size_MB // 100
 
     # xr's chunk method requires rows_per_chunk as input not n_chunks
-    times_per_chunk = 2 * ntimes // n_chunks
+    times_per_chunk = ntimes // n_chunks
 
     # Chunks method is number of pieces in the chunk
     # not the number of chunks. -1 gives a single chunk
@@ -613,7 +613,7 @@ def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
     shutil.rmtree(f"{outfile_tmp}")
 
 
-def convert(infile, outfile, compress=True, fits_in_memory=False):
+def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., num_cores=4):
     # Create temporary zarr store
     # Eventually clean-up by rechunking the zarr datastore
     outfile_tmp = outfile + ".tmp"
@@ -630,6 +630,15 @@ def convert(infile, outfile, compress=True, fits_in_memory=False):
 
         # Get unique baseline indices
         baseline_ant1_id, baseline_ant2_id = get_baseline_indices(MeasurementSet)
+
+        baseline_combinations = [
+            str(ll[0]).zfill(3) + "_" + str(ll[1]).zfill(3)
+            for ll in np.hstack([baseline_ant1_id[:, None], baseline_ant2_id[:, None]])
+        ]
+    
+        baselines = get_baselines(MeasurementSet)
+    
+        baseline_indices = np.searchsorted(baselines, baseline_combinations)
 
         # Base Dataset
         xds_base = xr.Dataset()
@@ -657,13 +666,23 @@ def convert(infile, outfile, compress=True, fits_in_memory=False):
             )
             
         else:
+            # Halve the available memory
+            # Assume the numpy arrays take up the same space in memory
+            # as the MeasurementSet
+            mem_avail *= 0.5 * 1024.**3
+            MS_size = get_dir_size(infile)
+
+            num_chunks = np.max([MS_size // mem_avail, 2])
+
+            time_chunks = np.array_split(unique_time_values, num_chunks)
             
             dask_jobs = []
-
+            
             MS_chunk_to_zarr(
                     xds_base.copy(deep=True),
-                    MeasurementSet.selectrows(np.where(time_values == unique_time_values[0])[0]),
-                    unique_time_values[0],
+                    # MeasurementSet.selectrows(np.where(time_values == unique_time_values[0])[0]),
+                    MeasurementSet.selectrows(np.where(np.isin(time_values, time_chunks[0]))[0]),
+                    time_chunks[0],
                     baseline_ant1_id,
                     baseline_ant2_id,
                     column_names,
@@ -671,24 +690,21 @@ def convert(infile, outfile, compress=True, fits_in_memory=False):
                     append=False,
                 )
             
-            # The xarray Dataset for each time value will become a Zarr chunk
-            for i, time in enumerate(unique_time_values):
-                if i == 0:
-                    continue
+            
+            
+            for i, time_chunk in enumerate(tqdm(time_chunks[1:], desc="Initial conversion to zarr", unit="time chunks")):
                     
-                else:
-                    dask_jobs.append(
-                        MS_chunk_to_zarr(
-                            xds_base.copy(deep=True),
-                            MeasurementSet.selectrows(np.where(time_values == time)[0]),
-                            time,
-                            baseline_ant1_id,
-                            baseline_ant2_id,
-                            column_names,
-                            outfile_tmp,
-                            append=True),
-                        )
+                MS_chunk_to_zarr(
+                    xds_base.copy(deep=True),
+                    # MeasurementSet.selectrows(np.where(time_values == time)[0]),
+                    MeasurementSet.selectrows(np.where(np.isin(time_values, time_chunk))[0]),
+                    time_chunk,
+                    baseline_ant1_id,
+                    baseline_ant2_id,
+                    column_names,
+                    outfile_tmp,
+                    append=True
+                    )
 
-            dask.compute(dask_jobs)
         
             rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
