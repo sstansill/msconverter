@@ -7,6 +7,8 @@ import shutil
 from tqdm import tqdm
 import os
 import dask
+import multiprocessing as mp
+from itertools import repeat
 
 
 # Named data variables (ie data)
@@ -105,7 +107,7 @@ stokes_types = {
 
 
 
-def get_dir_size(path='.'):
+def get_dir_size(path="."):
     total = 0
     with os.scandir(path) as it:
         for entry in it:
@@ -280,6 +282,7 @@ def get_baselines(MeasurementSet: tables.table) -> np.ndarray:
     return baselines
 
 
+
 # Need to convert pairs of antennas into indices
 # Integer indices required for array broadcasting
 def get_baseline_indices(MeasurementSet: tables.table) -> tuple:
@@ -360,14 +363,20 @@ def add_time(xds, MeasurementSet):
 
 def MS_chunk_to_zarr(
     xds,
-    MeasurementSet_chunk,
+    infile,
     times,
     baseline_ant1_id,
     baseline_ant2_id,
     column_names,
     outfile,
-    append,
+    append=False,
 ):
+    
+    MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
+    time_values = MeasurementSet.getcol("TIME")
+    
+    MeasurementSet_chunk = MeasurementSet.selectrows(np.where(np.isin(time_values, times))[0])
+    
     # Get all baseline pairs
     antenna1, antenna2 = (
         MeasurementSet_chunk.getcol("ANTENNA1"),
@@ -459,6 +468,7 @@ def MS_chunk_to_zarr(
     else:
         add_time(xds, MeasurementSet_chunk)
         xds.to_zarr(store=outfile, mode="w", compute=True)
+        return None
 
 
 def MS_to_zarr_in_memory(
@@ -580,6 +590,25 @@ def MS_to_zarr_in_memory(
     
 
 
+def concatenate_zarr(outfile_tmp, outfiles):
+    
+    xds = xr.open_zarr(outfiles[0])
+    
+    xds.to_zarr(outfile_tmp, mode="w", compute=True, consolidated=True)
+    
+    parallel_writes = []
+    
+    for outfile in outfiles[1:]:
+        xds = xr.open_zarr(outfile)
+        parallel_writes.append(xds.to_zarr(outfile_tmp, append_dim="time", compute=False))
+        
+    dask.compute(parallel_writes)
+    
+    for outfile in outfiles:
+        shutil.rmtree(f"{outfile}")
+
+
+
 # Chunk tuning required for optimal performance
 # Dask recommends at least 100MB chunk sizes
 # https://docs.dask.org/en/latest/array-best-practices.html
@@ -618,7 +647,7 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
     # Eventually clean-up by rechunking the zarr datastore
     outfile_tmp = outfile + ".tmp"
 
-    with tables.table(infile, readonly=True, lockoptions='autonoread') as MeasurementSet:
+    with tables.table(infile, readonly=True, lockoptions="autonoread") as MeasurementSet:
         # Initial checks
         time_interval = _check_interval_consistent(MeasurementSet)
         exposure_time = _check_exposure_consistent(MeasurementSet)
@@ -637,8 +666,6 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
         ]
     
         baselines = get_baselines(MeasurementSet)
-    
-        baseline_indices = np.searchsorted(baselines, baseline_combinations)
 
         # Base Dataset
         xds_base = xr.Dataset()
@@ -669,42 +696,39 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
             # Halve the available memory
             # Assume the numpy arrays take up the same space in memory
             # as the MeasurementSet
-            mem_avail *= 0.5 * 1024.**3
+            mem_avail *= 0.5 * 1024.**3 / num_cores
             MS_size = get_dir_size(infile)
 
             num_chunks = np.max([MS_size // mem_avail, 2])
 
             time_chunks = np.array_split(unique_time_values, num_chunks)
             
-            dask_jobs = []
-            
-            MS_chunk_to_zarr(
-                    xds_base.copy(deep=True),
-                    # MeasurementSet.selectrows(np.where(time_values == unique_time_values[0])[0]),
-                    MeasurementSet.selectrows(np.where(np.isin(time_values, time_chunks[0]))[0]),
-                    time_chunks[0],
-                    baseline_ant1_id,
-                    baseline_ant2_id,
-                    column_names,
-                    outfile_tmp,
-                    append=False,
-                )
-            
-            
-            
-            for i, time_chunk in enumerate(tqdm(time_chunks[1:], desc="Initial conversion to zarr", unit="time chunks")):
-                    
-                MS_chunk_to_zarr(
-                    xds_base.copy(deep=True),
-                    # MeasurementSet.selectrows(np.where(time_values == time)[0]),
-                    MeasurementSet.selectrows(np.where(np.isin(time_values, time_chunk))[0]),
-                    time_chunk,
-                    baseline_ant1_id,
-                    baseline_ant2_id,
-                    column_names,
-                    outfile_tmp,
-                    append=True
-                    )
 
-        
+            
+            outfiles = []
+            xds_list = []
+            
+            for i, time_chunk in enumerate(time_chunks):
+                outfiles.append(outfile_tmp + str(i))
+                xds_list.append(xds_base.copy(deep=True))
+                
+            pool = mp.Pool(num_cores)
+            
+            pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
+                                                            repeat(infile), 
+                                                            time_chunks, 
+                                                            repeat(baseline_ant1_id), 
+                                                            repeat(baseline_ant2_id), 
+                                                            repeat(column_names),
+                                                            outfiles,
+                                                            )
+            
+                                        )
+            
+            pool.close()
+            pool.terminate()
+            pool.join()
+            
+            concatenate_zarr(outfile_tmp, outfiles)
+                    
             rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
