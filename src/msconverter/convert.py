@@ -151,44 +151,60 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
 
     # Assumes only a single FIELD_ID
     delay_direction = {
-        "data": list(field.get("DELAY_DIR", [])),
+        "dims":"",
+        "data": field.get("DELAY_DIR", [0]).tolist()[0],
         "attrs": {
             "units": "rad",
             "type": "sky_coord",
             "description": "Direction of delay center in right ascension and declination.",
         },
     }
-
+    
     phase_direction = {
-        "data": list(field.get("PHASE_DIR", [])),
+        "dims":"",
+        "data": field.get("PHASE_DIR", [0]).tolist()[0],
         "attrs": {
             "units": "rad",
             "type": "sky_coord",
             "description": "Direction of phase center in right ascension and declination.",
         },
     }
+    
     reference_direction = {
-        "data": list(field.get("REFERENCE_DIR", [])),
+        "dims":"",
+        "data": field.get("REFERENCE_DIR", [0]).tolist()[0],
         "attrs": {
             "units": "rad",
             "type": "sky_coord",
             "description": "Direction of reference direction in right ascension and declination. Used in single-dish to record the associated reference direction if position-switching has already been applied. For interferometric data, this is the original correlated field center, and may equal delay_direction or phase_direction.",
         },
     }
-    name = field["NAME"]
-    code = field["CODE"]
-
+    
+    print(reference_direction["data"])
+    
+    name = field.get("NAME", "name")
+    code = field.get("CODE", "1")
+    
+    if name == "":
+        name = "name"
+    if code == "":
+        code = "1"
+        
     field_id = _check_single_field(MeasurementSet)
 
     field_info = {
         "name": name,
         "code": code,
-        # "delay_direction": delay_direction,
-        # "phase_direction": phase_direction,
-        # "reference_direction": reference_direction,
         "field_id": field_id,
+        # "delay_direction":delay_direction,
+        # "phase_direction":phase_direction,
+        # "reference_direction":reference_direction,
     }
-    # xds.attrs["field_info"] = field_info
+    
+    xds.attrs["delay_direction"] = delay_direction
+    xds.attrs["phase_direction"] = phase_direction
+    xds.attrs["reference_direction"] = reference_direction
+    xds.attrs["field_info"] = field_info
 
     ###############################################################
     # Add coordinates
@@ -259,9 +275,6 @@ def reshape_column(
     fulldata = np.full(cshape + column_data.shape[1:], np.nan, dtype=column_data.dtype)
 
     fulldata[time_indices, baselines] = column_data
-
-    # Use dask here to ensure xarray knows to use distributed methods on the zarr store
-    fulldata = da.from_array(fulldata)
 
     return fulldata
 
@@ -364,6 +377,7 @@ def add_time(xds, MeasurementSet):
 def MS_chunk_to_zarr(
     xds,
     infile,
+    time_values,
     times,
     baseline_ant1_id,
     baseline_ant2_id,
@@ -371,10 +385,9 @@ def MS_chunk_to_zarr(
     outfile,
     append=False,
 ):
-    
+    # TODO refactor MS loading
+    # Loading+querying uses a lot of memory
     MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
-    time_values = MeasurementSet.getcol("TIME")
-    
     MeasurementSet_chunk = MeasurementSet.selectrows(np.where(np.isin(time_values, times))[0])
     
     # Get all baseline pairs
@@ -633,7 +646,7 @@ def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
 
     # xr's chunk method requires rows_per_chunk as input not n_chunks
     times_per_chunk = ntimes // n_chunks
-
+    
     # Chunks method is number of pieces in the chunk
     # not the number of chunks. -1 gives a single chunk
     xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
@@ -647,88 +660,86 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
     # Eventually clean-up by rechunking the zarr datastore
     outfile_tmp = outfile + ".tmp"
 
-    with tables.table(infile, readonly=True, lockoptions="autonoread") as MeasurementSet:
-        # Initial checks
-        time_interval = _check_interval_consistent(MeasurementSet)
-        exposure_time = _check_exposure_consistent(MeasurementSet)
-        field_id = _check_single_field(MeasurementSet)
-
-        # Get the unique timestamps
-        time_values = MeasurementSet.getcol("TIME").flatten()
-        unique_time_values = np.unique(time_values)
-
-        # Get unique baseline indices
-        baseline_ant1_id, baseline_ant2_id = get_baseline_indices(MeasurementSet)
-
-        baseline_combinations = [
-            str(ll[0]).zfill(3) + "_" + str(ll[1]).zfill(3)
-            for ll in np.hstack([baseline_ant1_id[:, None], baseline_ant2_id[:, None]])
-        ]
+        
+    MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
     
-        baselines = get_baselines(MeasurementSet)
+    # Initial checks
+    time_interval = _check_interval_consistent(MeasurementSet)
+    exposure_time = _check_exposure_consistent(MeasurementSet)
+    field_id = _check_single_field(MeasurementSet)
 
-        # Base Dataset
-        xds_base = xr.Dataset()
+    # Get the unique timestamps
+    # TODO pass time values to MS_to_zarr functions to reduce memory footprint
+    time_values = MeasurementSet.getcol("TIME")
+    flat_time_values = time_values.flatten()
+    unique_time_values = np.unique(flat_time_values)
 
-        # Add dimensions, coordinates and attributes here to prevent
-        # repetition. Deep copy made for each loop iteration
-        xds_base = create_coordinates(
-            xds_base, MeasurementSet, unique_time_values, baseline_ant1_id, baseline_ant2_id, fits_in_memory
+    # Get unique baseline indices
+    baseline_ant1_id, baseline_ant2_id = get_baseline_indices(MeasurementSet)
+
+    # Base Dataset
+    xds_base = xr.Dataset()
+
+    # Add dimensions, coordinates and attributes here to prevent
+    # repetition. Deep copy made for each loop iteration
+    xds_base = create_coordinates(
+        xds_base, MeasurementSet, unique_time_values, baseline_ant1_id, baseline_ant2_id, fits_in_memory
+    )
+
+    column_names = MeasurementSet.colnames()
+
+    if fits_in_memory:
+        MS_to_zarr_in_memory(
+            xds_base,
+            MeasurementSet,
+            unique_time_values,
+            baseline_ant1_id,
+            baseline_ant2_id,
+            column_names,
+            infile,
+            outfile,
+            compress,
+            append=False,
         )
+        
+    else:
+        # Do not delete MeasurementSet from memory, otherwise must reload from disk rather than copied in memory
+        
+        # Halve the total available memory for safety
+        # Assumes the numpy arrays take up the same space in memory
+        # as the MeasurementSet
+        mem_avail *= 0.5 * 1024.**3 / num_cores
+        MS_size = get_dir_size(infile)
 
-        column_names = MeasurementSet.colnames()
+        num_chunks = np.max([MS_size // mem_avail, 2])
+        
 
-        if fits_in_memory:
-            MS_to_zarr_in_memory(
-                xds_base,
-                MeasurementSet,
-                unique_time_values,
-                baseline_ant1_id,
-                baseline_ant2_id,
-                column_names,
-                infile,
-                outfile,
-                compress,
-                append=False,
-            )
+        time_chunks = np.array_split(unique_time_values, num_chunks)
+        
+
+        
+        outfiles = []
+        xds_list = []
+        
+        for i, time_chunk in enumerate(time_chunks):
+            outfiles.append(outfile_tmp + str(i))
+            xds_list.append(xds_base.copy(deep=True))
             
-        else:
-            # Halve the available memory
-            # Assume the numpy arrays take up the same space in memory
-            # as the MeasurementSet
-            mem_avail *= 0.5 * 1024.**3 / num_cores
-            MS_size = get_dir_size(infile)
-
-            num_chunks = np.max([MS_size // mem_avail, 2])
-
-            time_chunks = np.array_split(unique_time_values, num_chunks)
-            
-
-            
-            outfiles = []
-            xds_list = []
-            
-            for i, time_chunk in enumerate(time_chunks):
-                outfiles.append(outfile_tmp + str(i))
-                xds_list.append(xds_base.copy(deep=True))
+        pool = mp.Pool(processes=num_cores)
+        
+        pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
+                                            repeat(infile), 
+                                            repeat(time_values),
+                                            time_chunks, 
+                                            repeat(baseline_ant1_id), 
+                                            repeat(baseline_ant2_id), 
+                                            repeat(column_names),
+                                            outfiles,
+                                            )
+                                    )
+        
+        pool.terminate()
+        
+        concatenate_zarr(outfile_tmp, outfiles)
                 
-            pool = mp.Pool(num_cores)
-            
-            pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
-                                                            repeat(infile), 
-                                                            time_chunks, 
-                                                            repeat(baseline_ant1_id), 
-                                                            repeat(baseline_ant2_id), 
-                                                            repeat(column_names),
-                                                            outfiles,
-                                                            )
-            
-                                        )
-            
-            pool.close()
-            pool.terminate()
-            pool.join()
-            
-            concatenate_zarr(outfile_tmp, outfiles)
-                    
-            rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
+        rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
