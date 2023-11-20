@@ -9,6 +9,17 @@ import os
 import dask
 import multiprocessing as mp
 from itertools import repeat
+from typing import Tuple
+import logging
+import math
+
+
+logging.basicConfig(
+    filename='msconverter.log',
+    filemode='w',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 
 # Named data variables (ie data)
@@ -180,8 +191,6 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
         },
     }
     
-    print(reference_direction["data"])
-    
     name = field.get("NAME", "name")
     code = field.get("CODE", "1")
     
@@ -266,7 +275,7 @@ def add_encoding(xds, compressor):
 # Reshape a column
 def reshape_column(
     column_data: np.ndarray,
-    cshape: tuple[int],
+    cshape: Tuple[int],
     time_indices: np.ndarray,
     baselines: np.ndarray,
 ):
@@ -383,13 +392,16 @@ def MS_chunk_to_zarr(
     baseline_ant2_id,
     column_names,
     outfile,
+    chunk_num,
+    chunk_total,
     append=False,
 ):
     # TODO refactor MS loading
     # Loading+querying uses a lot of memory
-    MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
-    MeasurementSet_chunk = MeasurementSet.selectrows(np.where(np.isin(time_values, times))[0])
-    
+    with tables.table(infile, readonly=True, lockoptions="autonoread") as ms:
+        MeasurementSet_chunk = ms.selectrows(np.where(np.isin(time_values, times))[0])
+    logging.info(f"({chunk_num}/{chunk_total}) Chunk retrieved.")
+
     # Get all baseline pairs
     antenna1, antenna2 = (
         MeasurementSet_chunk.getcol("ANTENNA1"),
@@ -409,8 +421,11 @@ def MS_chunk_to_zarr(
 
     baseline_indices = np.searchsorted(baselines, baseline_combinations)
 
+    logging.info(f"({chunk_num}/{chunk_total}) Column processing starting.")
+
     # Must loop over each column to create an xarray DataArray for each
     for column_name in column_names:
+        logging.info(f"({chunk_num}/{chunk_total}) Processing '{column_name}' column.")
         # Only handle certain columns. Others are metadata/coordinates
         if column_name in data_variable_columns:
             column_data = MeasurementSet_chunk.getcol(column_name)
@@ -456,6 +471,8 @@ def MS_chunk_to_zarr(
                 # Add the DataArray to the Dataset
                 xds[column_to_data_variable_names.get(column_name)] = xda
 
+    logging.info(f"({chunk_num}/{chunk_total}) Column processing complete.")
+
     # Add column metadata at the end
     # Adding metadata to a variable means the variable must already exist
     if not append:
@@ -473,6 +490,8 @@ def MS_chunk_to_zarr(
                     xds[column_to_data_variable_names[column_name]].attrs.update(
                         create_attribute_metadata(column_name, MeasurementSet_chunk)
                     )
+
+    logging.info(f"({chunk_num}/{chunk_total}) Column metadata complete.")
 
     # Each time value is a new chunk
     # Not clear is there's a way to change this behaviour
@@ -584,7 +603,7 @@ def MS_to_zarr_in_memory(
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
         add_encoding(xds, compressor)
         
-    MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    MS_size_MB = get_dir_size(path=infile) / (1024 ** 2)
     
     # Ceiling division so that chunks are at least 100MB
     # Integer casting always returns a smaller number so chunks >100MB
@@ -600,7 +619,6 @@ def MS_to_zarr_in_memory(
     xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
         
     return xds.to_zarr(store=outfile, mode="w", compute=True)
-    
 
 
 def concatenate_zarr(outfile_tmp, outfiles):
@@ -621,7 +639,6 @@ def concatenate_zarr(outfile_tmp, outfiles):
         shutil.rmtree(f"{outfile}")
 
 
-
 # Chunk tuning required for optimal performance
 # Dask recommends at least 100MB chunk sizes
 # https://docs.dask.org/en/latest/array-best-practices.html
@@ -638,7 +655,7 @@ def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
         add_encoding(xds, compressor)
         
-    MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    MS_size_MB = get_dir_size(path=infile) / (1024 ** 2)
     
     # Ceiling division so that chunks are at least 100MB
     # Integer casting always returns a smaller number so chunks >100MB
@@ -655,14 +672,15 @@ def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
     shutil.rmtree(f"{outfile_tmp}")
 
 
-def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., num_cores=4):
+def convert(infile, outfile, compress=True, fits_in_memory=False, memory_available=2., num_cores=4):
     # Create temporary zarr store
     # Eventually clean-up by rechunking the zarr datastore
+    logging.info("Logging started.")
     outfile_tmp = outfile + ".tmp"
 
-        
+    logging.info("Getting MeasurementSet.")
     MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
-    
+
     # Initial checks
     time_interval = _check_interval_consistent(MeasurementSet)
     exposure_time = _check_exposure_consistent(MeasurementSet)
@@ -670,6 +688,7 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
 
     # Get the unique timestamps
     # TODO pass time values to MS_to_zarr functions to reduce memory footprint
+    logging.info("Getting unique timestamps.")
     time_values = MeasurementSet.getcol("TIME")
     flat_time_values = time_values.flatten()
     unique_time_values = np.unique(flat_time_values)
@@ -682,6 +701,7 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
 
     # Add dimensions, coordinates and attributes here to prevent
     # repetition. Deep copy made for each loop iteration
+    logging.info("Creating coordinates.")
     xds_base = create_coordinates(
         xds_base, MeasurementSet, unique_time_values, baseline_ant1_id, baseline_ant2_id, fits_in_memory
     )
@@ -689,6 +709,7 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
     column_names = MeasurementSet.colnames()
 
     if fits_in_memory:
+        logging.info("Starting conversion in memory.")
         MS_to_zarr_in_memory(
             xds_base,
             MeasurementSet,
@@ -701,45 +722,49 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
             compress,
             append=False,
         )
-        
+        logging.info("Conversion complete.")
     else:
+        logging.info("Starting conversion in chunks.")
         # Do not delete MeasurementSet from memory, otherwise must reload from disk rather than copied in memory
         
         # Halve the total available memory for safety
         # Assumes the numpy arrays take up the same space in memory
         # as the MeasurementSet
-        mem_avail *= 0.5 * 1024.**3 / num_cores
-        MS_size = get_dir_size(infile)
+        memory_available_per_core = memory_available * 0.5 / num_cores
+        logging.info(f"Memory available per core: {memory_available_per_core:.2f}G.")
+        MS_size = get_dir_size(infile) / (1024 ** 3)
+        logging.info(f"MeasurementSet size: {MS_size:.2f}G.")
 
-        num_chunks = np.max([MS_size // mem_avail, 2])
-        
+        num_chunks = math.ceil(MS_size / memory_available_per_core)
+        logging.info(f"Number of cores: {num_cores}.")
+        logging.info(f"Number of chunks: {num_chunks}.")
 
         time_chunks = np.array_split(unique_time_values, num_chunks)
-        
 
-        
         outfiles = []
         xds_list = []
-        
+
         for i, time_chunk in enumerate(time_chunks):
             outfiles.append(outfile_tmp + str(i))
             xds_list.append(xds_base.copy(deep=True))
             
-        pool = mp.Pool(processes=num_cores)
-        
-        pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
-                                            repeat(infile), 
-                                            repeat(time_values),
-                                            time_chunks, 
-                                            repeat(baseline_ant1_id), 
-                                            repeat(baseline_ant2_id), 
-                                            repeat(column_names),
-                                            outfiles,
-                                            )
-                                    )
-        
-        pool.terminate()
-        
+        with mp.Pool(processes=num_cores) as pool:
+            pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
+                                                repeat(infile), 
+                                                repeat(time_values),
+                                                time_chunks,
+                                                repeat(baseline_ant1_id), 
+                                                repeat(baseline_ant2_id), 
+                                                repeat(column_names),
+                                                outfiles,
+                                                np.arange(1, num_chunks + 1),
+                                                repeat(num_chunks),
+                                                )
+                                        )
+
+        logging.info("Concatenation starting.")
         concatenate_zarr(outfile_tmp, outfiles)
-                
+
+        logging.info("Rechunk starting.")
         rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
+        logging.info("Conversion complete.")
