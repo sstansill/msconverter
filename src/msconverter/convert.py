@@ -11,6 +11,7 @@ from dask.distributed import LocalCluster, Client, wait
 import multiprocessing as mp
 import pandas as pd
 import numba as nb
+import zarr
 
 # Use np.sort(pd.unique(arr)) not np.unique(arr) for large arrays: https://stackoverflow.com/questions/13688784/python-speedup-np-unique
 
@@ -68,7 +69,7 @@ column_to_data_variable_names = {
     "FLOAT_DATA": "SPECTRUM",
     "DATA": "VISIBILITY",
     "CORRECTED_DATA": "VISIBILITY_CORRECTED",
-    "WEIGHT_SPECTRUM": "WEIGHT",
+    "WEIGHT_SPECTRUM": "WEIGHT_SPECTRUM",
     "WEIGHT": "WEIGHT",
     "FLAG": "FLAG",
     "UVW": "UVW",
@@ -438,8 +439,11 @@ def MS_chunk_to_zarr(
     antenna1_column_length,
     column_names,
     outfile,
+    compress,
+    times_per_chunk,
     append=False,
 ):
+    
     # TODO refactor MS loading
     # Loading+querying uses a lot of memory
     MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
@@ -517,6 +521,20 @@ def MS_chunk_to_zarr(
                         create_attribute_metadata(column_name, MeasurementSet_chunk)
                     )
 
+
+
+    # Manually delete encoding otherwise to_zarr() fails
+    # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
+    # for var in xds:
+        # del xds[var].encoding["chunks"]
+   
+    # Compression slows down the conversion a lot
+    if compress:
+        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+        add_encoding(xds, compressor)
+        
+    xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
+        
     # Each time value is a new chunk
     # Not clear is there's a way to change this behaviour
     if append:
@@ -636,33 +654,37 @@ def MS_to_zarr_in_memory(
 
 def concatenate_zarr_rechunk(infile, outfile_tmp, outfiles, compress, ntimes, client):
     
-    MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    # MS_size_MB = get_dir_size(path=infile) / (1024*1024)
     
-    # Ceiling division so that chunks are at least 100MB
-    # Integer casting always returns a smaller number so chunks >100MB
-    n_chunks = MS_size_MB // 100
+    # # Ceiling division so that chunks are at least 100MB
+    # # Integer casting always returns a smaller number so chunks >100MB
+    # n_chunks = MS_size_MB // 100
 
-    # xr's chunk method requires rows_per_chunk as input not n_chunks
-    times_per_chunk = ntimes // n_chunks
+    # # xr's chunk method requires rows_per_chunk as input not n_chunks
+    # times_per_chunk = ntimes // n_chunks
     
     xds = xr.open_zarr(outfiles[0])
 
-    # Manually delete encoding otherwise to_zarr() fails
-    # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
-    for var in xds:
-        del xds[var].encoding["chunks"]
+    # # Manually delete encoding otherwise to_zarr() fails
+    # # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
+    # for var in xds:
+    #     del xds[var].encoding["chunks"]
    
-    # Compression slows down the conversion a lot
-    if compress:
-        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-        add_encoding(xds, compressor)
+    # # Compression slows down the conversion a lot
+    # if compress:
+    #     compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+    #     add_encoding(xds, compressor)
     
     
-    # Chunks method is number of pieces in the chunk
-    # not the number of chunks. -1 gives a single chunk
-    xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
+    # # Chunks method is number of pieces in the chunk
+    # # not the number of chunks. -1 gives a single chunk
+    # xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
     
     xds.to_zarr(outfile_tmp, mode="w", compute=True, consolidated=True)
+    
+    # synchronizer = zarr.ProcessSynchronizer(outfile_tmp)
+    synchronizer = zarr.ThreadSynchronizer()
+    
     
     parallel_writes = []
     
@@ -670,21 +692,21 @@ def concatenate_zarr_rechunk(infile, outfile_tmp, outfiles, compress, ntimes, cl
         xds = xr.open_zarr(outfile)
         # xds.to_zarr(outfile_tmp, append_dim="time", compute=True)
 
-        # Manually delete encoding otherwise to_zarr() fails
-        # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
-        for var in xds:
-            del xds[var].encoding["chunks"]
+        # # Manually delete encoding otherwise to_zarr() fails
+        # # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
+        # for var in xds:
+        #     del xds[var].encoding["chunks"]
     
-        # Compression slows down the conversion a lot
-        if compress:
-            compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-            add_encoding(xds, compressor)
+        # # Compression slows down the conversion a lot
+        # if compress:
+        #     compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+        #     add_encoding(xds, compressor)
         
         
-        # Chunks method is number of pieces in the chunk
-        # not the number of chunks. -1 gives a single chunk
-        xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
-        parallel_writes.append(xds.to_zarr(outfile_tmp, append_dim="time", compute=False))
+        # # Chunks method is number of pieces in the chunk
+        # # not the number of chunks. -1 gives a single chunk
+        # xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
+        parallel_writes.append(xds.to_zarr(outfile_tmp, append_dim="time", compute=False, synchronizer=synchronizer))
         
     future = client.compute(parallel_writes)
     wait(future)
@@ -693,7 +715,7 @@ def concatenate_zarr_rechunk(infile, outfile_tmp, outfiles, compress, ntimes, cl
         shutil.rmtree(f"{outfile}")
 
 
-def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., num_procs=4):
+def convert(infile, outfile, compress=False, fits_in_memory=False, mem_avail=2., num_procs=4):
     # Ensure JIT compilation before multiprocessing pool is spawned
     searchsorted_nb(np.array([0.,1.]), np.array([0.,1.]))
     isin_nb(np.array([0,1]), np.array([0,1]))
@@ -757,7 +779,13 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
         num_chunks = np.max([MS_size // mem_avail_per_process, num_procs])
 
         time_chunks = np.array_split(unique_time_values, num_chunks)
+    
+        # Ceiling division so that chunks are at least 100MB
+        # Integer casting always returns a smaller number so chunks >100MB
+        n_chunks = (MS_size / (1024*1024)) // 100
 
+        # xr's chunk method requires rows_per_chunk as input not n_chunks
+        times_per_chunk = len(unique_time_values) // n_chunks
         
         outfiles = []
         xds_list = []
@@ -765,6 +793,8 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
         infiles = []
         antenna_length_list = []
         column_name_list = []
+        compressed_list = []
+        times_per_chunk_list = []
         
         for i, time_chunk in enumerate(time_chunks):
             outfiles.append(outfile_tmp + str(i))
@@ -773,6 +803,8 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
             infiles.append(infile)
             antenna_length_list.append(antenna1_column_length)
             column_name_list.append(column_names)
+            compressed_list.append(compress)
+            times_per_chunk_list.append(times_per_chunk)
         
         del time_values
         
@@ -786,6 +818,8 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
                                             antenna_length_list,
                                             column_name_list,
                                             outfiles,
+                                            compressed_list,
+                                            times_per_chunk_list,
                                             ),
                                         chunksize=1,
                                     )
@@ -793,9 +827,9 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
         pool.close()
         pool.join()
             
-        with LocalCluster(n_workers=num_procs,
-                          processes=True,
-                          threads_per_worker=1,
+        with LocalCluster(n_workers=1,
+                          processes=False,
+                          threads_per_worker=num_procs,
                           memory_limit=f"{mem_avail}GiB",
                         ) as cluster, Client(cluster) as client:
             
