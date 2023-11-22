@@ -88,6 +88,20 @@ data_variable_columns = [
     "UVW",
     "TIME_CENTROID",
     "EXPOSURE",
+    "FLAG_CATEGORY",
+    "MODEL_DATA",
+    "SIGMA",
+    "ARRAY_ID",
+    "DATA_DESC_ID",
+    "FEED1",
+    "FEED2",
+    "FIELD_ID",
+    "FLAG_ROW",
+    "INTERVAL",
+    "OBSERVATION_ID",
+    "PROCESSOR_ID",
+    "SCAN_NUMBER",
+    "STATE_ID",
 ]
 
 
@@ -105,6 +119,20 @@ column_to_data_variable_names = {
     "U": "U",
     "V": "V",
     "W": "W",
+    "FLAG_CATEGORY": "FLAG_CATEGORY",
+    "MODEL_DATA": "MODEL_DATA",
+    "SIGMA": "SIGMA",
+    "ARRAY_ID": "ARRAY_ID",
+    "DATA_DESC_ID": "DATA_DESC_ID",
+    "FEED1": "FEED1",
+    "FEED2": "FEED2",
+    "FIELD_ID": "FIELD_ID",
+    "FLAG_ROW": "FLAG_ROW",
+    "INTERVAL": "INTERVAL",
+    "OBSERVATION_ID": "OBSERVATION_ID",
+    "PROCESSOR_ID": "PROCESSOR_ID",
+    "SCAN_NUMBER": "SCAN_NUMBER",
+    "STATE_ID": "STATE_ID",
 }
 
 
@@ -122,8 +150,20 @@ column_dimensions = {
     "TIME_CENTROID": ("time", "baseline_id"),
     "EXPOSURE": ("time", "baseline_id"),
     "FLOAT_DATA": ("time", "baseline_id", "frequency", "polarization"),
+    "FLAG_CATEGORY": ("time", "baseline_id", "frequency", "polarization"),
+    "MODEL_DATA": ("time", "baseline_id", "frequency", "polarization"),
+    "SIGMA": ("time", "baseline_id", "polarization"),
+    "ARRAY_ID": ("time", "baseline_id"),
+    "DATA_DESC_ID": ("time", "baseline_id"),
+    "FEED1": ("time", "baseline_id"),
+    "FEED2": ("time", "baseline_id"),
+    "FIELD_ID": ("time", "baseline_id"),
+    "FLAG_ROW": ("time", "baseline_id"),
+    "OBSERVATION_ID": ("time", "baseline_id"),
+    "PROCESSOR_ID": ("time", "baseline_id"),
+    "SCAN_NUMBER": ("time", "baseline_id"),
+    "STATE_ID": ("time", "baseline_id"),
 }
-
 
 # Rename coordinate columns to something sensible
 column_to_coord_names = {
@@ -259,15 +299,14 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
         "name": name,
         "code": code,
         "field_id": field_id,
-        # "delay_direction":delay_direction,
-        # "phase_direction":phase_direction,
-        # "reference_direction":reference_direction,
     }
     
     xds.attrs["delay_direction"] = delay_direction
     xds.attrs["phase_direction"] = phase_direction
     xds.attrs["reference_direction"] = reference_direction
     xds.attrs["field_info"] = field_info
+    
+    
 
     ###############################################################
     # Add coordinates
@@ -493,88 +532,7 @@ def MS_chunk_to_zarr(
         # Must loop over each column to create an xarray DataArray for each
         for column_name in column_names:
             
-            # Only handle certain columns. Others are metadata/coordinates
-            if column_name in data_variable_columns:
-                column_data = MeasurementSet_chunk.getcol(column_name)
-
-                # UVW column must be split into u, v, and w
-                if column_name == "UVW":
-                    subcolumns = [column_data[:, 0], column_data[:, 1], column_data[:, 2]]
-                    subcolumn_names = ["U", "V", "W"]
-
-                    for data, name in zip(subcolumns, subcolumn_names):
-                        reshaped_column = reshape_column(
-                            data,
-                            data_shape,
-                            time_indices,
-                            baseline_indices,
-                        )
-
-                        # Create a DataArray instead of appending immediately to Dataset
-                        # so time coordinates can be updated
-                        xda = xr.DataArray(
-                            reshaped_column,
-                            dims=column_dimensions.get(name),
-                        ).assign_coords(time=("time", times))
-
-                        # Add the DataArray to the Dataset
-                        xds[column_to_data_variable_names.get(name)] = xda
-
-                else:
-                    reshaped_column = reshape_column(
-                        column_data,
-                        data_shape,
-                        time_indices,
-                        baseline_indices,
-                    )
-
-                    # Create a DataArray instead of appending immediately to Dataset
-                    # so time coordinates can be updated
-                    xda = xr.DataArray(
-                        reshaped_column,
-                        dims=column_dimensions.get(column_name),
-                    ).assign_coords(time=("time", times))
-
-                    # Add the DataArray to the Dataset
-                    xds[column_to_data_variable_names.get(column_name)] = xda
-
-                    # Add column metadata at the end
-                    # Adding metadata to a variable means the variable must already exist
-
-                    xds[column_to_data_variable_names[column_name]].attrs.update(
-                        create_attribute_metadata(column_name, MeasurementSet_chunk)
-                        )
-            
-        xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
-            
-        add_time(xds, MeasurementSet_chunk)
-        write = xds.to_zarr(store=outfile, mode="w", compute=True)
-    return
-
-
-def MS_to_zarr_in_memory(
-    xds,
-    MeasurementSet,
-    unique_times,
-    num_unique_baselines,
-    column_names,
-    infile,
-    outfile,
-    append,
-):
-
-
-    # Get dimensions of data
-    time_indices = searchsorted_nb(unique_times, MeasurementSet.getcol("TIME"))
-    data_shape = (len(unique_times), num_unique_baselines)
-
-    baseline_indices = get_baseline_indices(MeasurementSet)
-
-    # Must loop over each column to create an xarray DataArray for each
-    for column_name in column_names:
-        # Only handle certain columns. Others are metadata/coordinates
-        if column_name in data_variable_columns:
-            column_data = MeasurementSet.getcol(column_name)
+            column_data = MeasurementSet_chunk.getcol(column_name)
 
             # UVW column must be split into u, v, and w
             if column_name == "UVW":
@@ -594,7 +552,7 @@ def MS_to_zarr_in_memory(
                     xda = xr.DataArray(
                         reshaped_column,
                         dims=column_dimensions.get(name),
-                    )
+                    ).assign_coords(time=("time", times))
 
                     # Add the DataArray to the Dataset
                     xds[column_to_data_variable_names.get(name)] = xda
@@ -612,28 +570,102 @@ def MS_to_zarr_in_memory(
                 xda = xr.DataArray(
                     reshaped_column,
                     dims=column_dimensions.get(column_name),
-                )
+                ).assign_coords(time=("time", times))
 
                 # Add the DataArray to the Dataset
                 xds[column_to_data_variable_names.get(column_name)] = xda
 
+                # Add column metadata at the end
+                # Adding metadata to a variable means the variable must already exist
+
+                xds[column_to_data_variable_names[column_name]].attrs.update(
+                    create_attribute_metadata(column_name, MeasurementSet_chunk)
+                    )
+            
+        xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
+            
+        add_time(xds, MeasurementSet_chunk)
+        xds.to_zarr(store=outfile, mode="w", compute=True)
+    return
+
+
+def MS_to_zarr_in_memory(
+    xds,
+    MeasurementSet,
+    unique_times,
+    num_unique_baselines,
+    column_names,
+    infile,
+    outfile,
+):
+
+
+    # Get dimensions of data
+    time_indices = searchsorted_nb(unique_times, MeasurementSet.getcol("TIME"))
+    data_shape = (len(unique_times), num_unique_baselines)
+
+    baseline_indices = get_baseline_indices(MeasurementSet)
+
+    # Must loop over each column to create an xarray DataArray for each
+    for column_name in column_names:
+        column_data = MeasurementSet.getcol(column_name)
+
+        # UVW column must be split into u, v, and w
+        if column_name == "UVW":
+            subcolumns = [column_data[:, 0], column_data[:, 1], column_data[:, 2]]
+            subcolumn_names = ["U", "V", "W"]
+
+            for data, name in zip(subcolumns, subcolumn_names):
+                reshaped_column = reshape_column(
+                    data,
+                    data_shape,
+                    time_indices,
+                    baseline_indices,
+                )
+
+                # Create a DataArray instead of appending immediately to Dataset
+                # so time coordinates can be updated
+                xda = xr.DataArray(
+                    reshaped_column,
+                    dims=column_dimensions.get(name),
+                )
+
+                # Add the DataArray to the Dataset
+                xds[column_to_data_variable_names.get(name)] = xda
+
+        else:
+            reshaped_column = reshape_column(
+                column_data,
+                data_shape,
+                time_indices,
+                baseline_indices,
+            )
+
+            # Create a DataArray instead of appending immediately to Dataset
+            # so time coordinates can be updated
+            xda = xr.DataArray(
+                reshaped_column,
+                dims=column_dimensions.get(column_name),
+            )
+
+            # Add the DataArray to the Dataset
+            xds[column_to_data_variable_names.get(column_name)] = xda
+
     # Add column metadata at the end
     # Adding metadata to a variable means the variable must already exist
-    if not append:
-        for column_name in column_names:
-            if column_name in data_variable_columns:
-                if column_name == "UVW":
-                    subcolumn_names = ["U", "V", "W"]
+    for column_name in column_names:
+        if column_name == "UVW":
+            subcolumn_names = ["U", "V", "W"]
 
-                    for subcolumn_name in subcolumn_names:
-                        xds[column_to_data_variable_names[subcolumn_name]].attrs.update(
-                            create_attribute_metadata(column_name, MeasurementSet)
-                        )
+            for subcolumn_name in subcolumn_names:
+                xds[column_to_data_variable_names[subcolumn_name]].attrs.update(
+                    create_attribute_metadata(column_name, MeasurementSet)
+                )
 
-                else:
-                    xds[column_to_data_variable_names[column_name]].attrs.update(
-                        create_attribute_metadata(column_name, MeasurementSet)
-                    )
+        else:
+            xds[column_to_data_variable_names[column_name]].attrs.update(
+                create_attribute_metadata(column_name, MeasurementSet)
+            )
         
     MS_size_MB = get_dir_size(path=infile) / (1024*1024)
     
@@ -692,6 +724,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
 
     # Get the unique timestamps
     # TODO pass time values to MS_to_zarr functions to reduce memory footprint
+    # TODO use .col() instead of .getcol() for lazy loading and selecting
     time_values = MeasurementSet.getcol("TIME")
     unique_time_values = np.sort(pd.unique(time_values))
 
@@ -709,6 +742,18 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
     )
 
     column_names = MeasurementSet.colnames()
+    
+    columns_to_convert = []
+    
+    for col_name in column_names:
+        if col_name in data_variable_columns:
+            try:
+                # Check that the column is populated
+                if MeasurementSet.col(col_name)[0] is not None:
+                    columns_to_convert.append(col_name)
+                    
+            except:
+                pass
 
     if fits_in_memory:
         MS_to_zarr_in_memory(
@@ -716,10 +761,9 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
             MeasurementSet,
             unique_time_values,
             num_unique_baselines,
-            column_names,
+            columns_to_convert,
             infile,
             outfile,
-            append=False,
         )
         
     else:
@@ -741,6 +785,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
 
         # xr's chunk method requires rows_per_chunk as input not n_chunks
         times_per_chunk = len(unique_time_values) // n_chunks
+
         
         outfiles = []
         xds_list = []
@@ -761,7 +806,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
             antenna_length_list.append(deepcopy(num_unique_baselines))
             column_name_list.append(deepcopy(column_names))
             times_per_chunk_list.append(deepcopy(times_per_chunk))
-            data_variables_list.append(deepcopy(data_variable_columns))
+            data_variables_list.append(deepcopy(columns_to_convert))
             column_dimension_list.append(deepcopy(column_dimensions))
             column_to_variable_list.append(deepcopy(column_to_data_variable_names))
         
