@@ -159,6 +159,7 @@ column_dimensions = {
     "FEED2": ("time", "baseline_id"),
     "FIELD_ID": ("time", "baseline_id"),
     "FLAG_ROW": ("time", "baseline_id"),
+    "INTERVAL": ("time", "baseline_id"),
     "OBSERVATION_ID": ("time", "baseline_id"),
     "PROCESSOR_ID": ("time", "baseline_id"),
     "SCAN_NUMBER": ("time", "baseline_id"),
