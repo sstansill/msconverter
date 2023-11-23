@@ -512,7 +512,6 @@ def MS_chunk_to_zarr(
     row_indices,
     times,
     num_unique_baselines,
-    column_names,
     outfile,
     times_per_chunk,
     data_variable_columns,
@@ -531,7 +530,7 @@ def MS_chunk_to_zarr(
         baseline_indices = get_baseline_indices(MeasurementSet_chunk)
 
         # Must loop over each column to create an xarray DataArray for each
-        for column_name in column_names:
+        for column_name in data_variable_columns:
             
             column_data = MeasurementSet_chunk.getcol(column_name)
 
@@ -805,7 +804,6 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
             row_indices_list.append(np.where(isin_nb(time_values, time_chunk))[0])
             infiles.append(deepcopy(infile))
             antenna_length_list.append(deepcopy(num_unique_baselines))
-            column_name_list.append(deepcopy(column_names))
             times_per_chunk_list.append(deepcopy(times_per_chunk))
             data_variables_list.append(deepcopy(columns_to_convert))
             column_dimension_list.append(deepcopy(column_dimensions))
@@ -825,7 +823,6 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
                                                 row_indices_list,
                                                 time_chunks, 
                                                 antenna_length_list,
-                                                column_name_list,
                                                 outfiles,
                                                 times_per_chunk_list,
                                                 data_variables_list,
