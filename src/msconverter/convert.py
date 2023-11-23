@@ -482,8 +482,16 @@ def create_attribute_metadata(column_name, MeasurementSet):
 # Separate function to add time attributes. Must happen after the
 # time coordinate is created
 def add_time(xds, MeasurementSet):
-    interval = MeasurementSet.col("INTERVAL")[0]
-    exposure = MeasurementSet.col("EXPOSURE")[0]
+    try:
+        interval = MeasurementSet.col("INTERVAL")[0]
+    except:
+        interval = "None"
+        
+    try:
+        exposure = MeasurementSet.col("EXPOSURE")[0]
+    except:
+        exposure = "None"
+    
     time_description = MeasurementSet.getcoldesc("TIME")
 
     xds.time.attrs["type"] = time_description.get("MEASINFO", {}).get("type", "None")
