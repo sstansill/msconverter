@@ -19,17 +19,15 @@ def searchsorted_nb(a, b):
         res[i] = np.searchsorted(a, b[i])
     return res
 
-@nb.njit(parallel=False, fastmath=True)
-def isin_nb(a: np.ndarray, b: np.ndarray):
-    shape = a.shape
-    a = a.ravel()
+@nb.njit(parallel=True, fastmath=True)
+def isin_nb(a, b):
     n = len(a)
     result = np.full(n, False)
     set_b = set(b)
-    for i in range(n):
+    for i in nb.prange(n):
         if a[i] in set_b:
             result[i] = True
-    return result.reshape(shape)
+    return result
 
 @nb.njit(parallel=False, fastmath=True)
 def antennas_to_indices(antenna1, antenna2):
@@ -703,8 +701,9 @@ def concatenate_stores(infile, outfile_tmp, outfiles, times_per_chunk, client):
     return
 
 
-def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
+def convert(infile, outfile, fits_in_memory=False, mem_avail=4., num_procs=1):
     # Ensure JIT compilation before multiprocessing pool is spawned
+    nb.set_num_threads(num_procs)
     searchsorted_nb(np.array([0.,1.]), np.array([0.,1.]))
     isin_nb(np.array([0.,1.]), np.array([0.,1.]))
     antennas_to_indices(np.array([0,1]), np.array([1,2]))
