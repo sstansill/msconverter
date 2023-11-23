@@ -12,7 +12,7 @@ The package can be loaded as a pip package. To install:
 4) Activate the conda environment `conda activate msconverter`
 5) Install pip dependencies `pip install -e .`
 6) Inside a Python shell, use the converter with `from msconverter import convert`
-7) `convert.convert(infile, outfile, compress=True)`
+7) `convert.convert(infile, outfile)`
 
 ---
 
@@ -27,7 +27,7 @@ infile = "/path/to/MeasurementSet"
 outfile = "/path/to/ZarrStore"
 
 if __name__ == "__main__":
-    convert.convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=4., num_procs=4)
+    convert.convert(infile, outfile, fits_in_memory=False, mem_avail=8., num_procs=4)
 
 ```
 
@@ -35,7 +35,6 @@ if __name__ == "__main__":
 
 ## Options
 
-- `compress` option can be used to toggle whether data is compressed using the lossless Zstandard compression algorithm.
 - `fits_in_memory` should be set to `False` if the size of the MeasurementSet to be converted is more than half of the available system memory (both the MeasurementSet and the xarray DataSet will be held in memory)
 - `num_procs` is the number of processes to be spawned by the multiprocessing library
 - `mem_avail` is the total memory to be used by the Python script (unstable)
