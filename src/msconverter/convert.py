@@ -1,14 +1,79 @@
 from casacore import tables
 import numpy as np
 import xarray as xr
-from numcodecs import Blosc
-import dask.array as da
 import shutil
-from tqdm import tqdm
 import os
-import dask
+from dask.distributed import LocalCluster, Client, wait
 import multiprocessing as mp
-from itertools import repeat
+import pandas as pd
+import numba as nb
+import zarr
+from copy import deepcopy
+
+# Use np.sort(pd.unique(arr)) not np.unique(arr) for large arrays: https://stackoverflow.com/questions/13688784/python-speedup-np-unique
+
+@nb.njit(parallel=False, fastmath=True)
+def searchsorted_nb(a, b):
+    res = np.empty(len(b), np.intp)
+    for i in nb.prange(len(b)):
+        res[i] = np.searchsorted(a, b[i])
+    return res
+
+@nb.njit(parallel=False, fastmath=True)
+def isin_nb(a: np.ndarray, b: np.ndarray):
+    shape = a.shape
+    a = a.ravel()
+    n = len(a)
+    result = np.full(n, False)
+    set_b = set(b)
+    for i in range(n):
+        if a[i] in set_b:
+            result[i] = True
+    return result.reshape(shape)
+
+@nb.njit(parallel=False, fastmath=True)
+def antennas_to_indices(antenna1, antenna2):
+    all_baselines = np.empty(antenna1.size, dtype=np.int32)
+    
+    for i in nb.prange(len(antenna1)):
+        # This is a Cantor pairing funciton
+        # max_num_antenna_pairs required to give expected ordering (20000 may be too small for certain SKA-low observations)
+        # see https://math.stackexchange.com/questions/3212587/does-there-exist-a-pairing-function-which-preserves-ordering
+        # and https://math.stackexchange.com/questions/3969617/what-pairing-function-coincides-with-the-g%C3%B6del-pairing-on-the-natural-numbers
+        max_num_antenna_pairs = 20000
+        all_baselines[i] = ((antenna1[i] + antenna2[i]) * (antenna1[i] + antenna2[i] + 1)) // 2 + max_num_antenna_pairs*antenna1[i]
+
+    return all_baselines
+
+@nb.njit(parallel=False, fastmath=True)
+def invertible_indices(antenna1, antenna2):
+    all_baselines = np.empty(antenna1.size, dtype=np.int32)
+    
+    for i in nb.prange(len(antenna1)):
+        # This is a Cantor pairing funciton
+        # max_num_antenna_pairs required to give expected ordering (20000 may be too small for certain SKA-low observations)
+        # see https://math.stackexchange.com/questions/3212587/does-there-exist-a-pairing-function-which-preserves-ordering
+        # and https://math.stackexchange.com/questions/3969617/what-pairing-function-coincides-with-the-g%C3%B6del-pairing-on-the-natural-numbers
+        max_num_antenna_pairs = 20000
+        all_baselines[i] = ((antenna1[i] + antenna2[i]) * (antenna1[i] + antenna2[i] + 1)) // 2 + antenna2[i]
+
+    return all_baselines
+
+
+@nb.njit(parallel=False, fastmath=True)
+def indices_to_baseline_ids(unique_baselines):
+    baseline_id1 = np.empty(unique_baselines.size, dtype=np.int32)
+    baseline_id2 = np.empty(unique_baselines.size, dtype=np.int32)
+    
+    for i in nb.prange(len(unique_baselines)):
+        # Inverse Cantor pairing funciton
+        w = (np.sqrt(8*unique_baselines[i]+1) - 1) // 2
+        t = (w * (w+1)) / 2
+        y = unique_baselines[i] - t
+        baseline_id2[i] = y
+        baseline_id1[i] = w - y
+
+    return (baseline_id1, baseline_id2)
 
 
 # Named data variables (ie data)
@@ -23,6 +88,20 @@ data_variable_columns = [
     "UVW",
     "TIME_CENTROID",
     "EXPOSURE",
+    "FLAG_CATEGORY",
+    "MODEL_DATA",
+    "SIGMA",
+    "ARRAY_ID",
+    "DATA_DESC_ID",
+    "FEED1",
+    "FEED2",
+    "FIELD_ID",
+    "FLAG_ROW",
+    "INTERVAL",
+    "OBSERVATION_ID",
+    "PROCESSOR_ID",
+    "SCAN_NUMBER",
+    "STATE_ID",
 ]
 
 
@@ -31,7 +110,7 @@ column_to_data_variable_names = {
     "FLOAT_DATA": "SPECTRUM",
     "DATA": "VISIBILITY",
     "CORRECTED_DATA": "VISIBILITY_CORRECTED",
-    "WEIGHT_SPECTRUM": "WEIGHT",
+    "WEIGHT_SPECTRUM": "WEIGHT_SPECTRUM",
     "WEIGHT": "WEIGHT",
     "FLAG": "FLAG",
     "UVW": "UVW",
@@ -40,6 +119,20 @@ column_to_data_variable_names = {
     "U": "U",
     "V": "V",
     "W": "W",
+    "FLAG_CATEGORY": "FLAG_CATEGORY",
+    "MODEL_DATA": "MODEL_DATA",
+    "SIGMA": "SIGMA",
+    "ARRAY_ID": "ARRAY_ID",
+    "DATA_DESC_ID": "DATA_DESC_ID",
+    "FEED1": "FEED1",
+    "FEED2": "FEED2",
+    "FIELD_ID": "FIELD_ID",
+    "FLAG_ROW": "FLAG_ROW",
+    "INTERVAL": "INTERVAL",
+    "OBSERVATION_ID": "OBSERVATION_ID",
+    "PROCESSOR_ID": "PROCESSOR_ID",
+    "SCAN_NUMBER": "SCAN_NUMBER",
+    "STATE_ID": "STATE_ID",
 }
 
 
@@ -57,8 +150,21 @@ column_dimensions = {
     "TIME_CENTROID": ("time", "baseline_id"),
     "EXPOSURE": ("time", "baseline_id"),
     "FLOAT_DATA": ("time", "baseline_id", "frequency", "polarization"),
+    "FLAG_CATEGORY": ("time", "baseline_id", "frequency", "polarization"),
+    "MODEL_DATA": ("time", "baseline_id", "frequency", "polarization"),
+    "SIGMA": ("time", "baseline_id", "polarization"),
+    "ARRAY_ID": ("time", "baseline_id"),
+    "DATA_DESC_ID": ("time", "baseline_id"),
+    "FEED1": ("time", "baseline_id"),
+    "FEED2": ("time", "baseline_id"),
+    "FIELD_ID": ("time", "baseline_id"),
+    "FLAG_ROW": ("time", "baseline_id"),
+    "INTERVAL": ("time", "baseline_id"),
+    "OBSERVATION_ID": ("time", "baseline_id"),
+    "PROCESSOR_ID": ("time", "baseline_id"),
+    "SCAN_NUMBER": ("time", "baseline_id"),
+    "STATE_ID": ("time", "baseline_id"),
 }
-
 
 # Rename coordinate columns to something sensible
 column_to_coord_names = {
@@ -121,21 +227,21 @@ def get_dir_size(path="."):
 
 # Check that the time steps have a single unique value
 def _check_interval_consistent(MeasurementSet):
-    time_interval = np.unique(MeasurementSet.getcol("INTERVAL"))
+    time_interval = pd.unique(MeasurementSet.getcol("INTERVAL"))
     assert len(time_interval) == 1, "Interval is not consistent."
     return time_interval[0]
 
 
 # Check that the time steps have a single unique value
 def _check_exposure_consistent(MeasurementSet):
-    exposure_time = np.unique(MeasurementSet.getcol("EXPOSURE"))
+    exposure_time = pd.unique(MeasurementSet.getcol("EXPOSURE"))
     assert len(exposure_time) == 1, "Exposure is not consistent."
     return exposure_time[0]
 
 
 # Check that the FIELD_ID has a single unique value
 def _check_single_field(MeasurementSet):
-    field_id = np.unique(MeasurementSet.getcol("FIELD_ID"))
+    field_id = pd.unique(MeasurementSet.getcol("FIELD_ID"))
     assert len(field_id) == 1, "More than one field present."
     return field_id[0]
 
@@ -180,8 +286,6 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
         },
     }
     
-    print(reference_direction["data"])
-    
     name = field.get("NAME", "name")
     code = field.get("CODE", "1")
     
@@ -196,15 +300,14 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
         "name": name,
         "code": code,
         "field_id": field_id,
-        # "delay_direction":delay_direction,
-        # "phase_direction":phase_direction,
-        # "reference_direction":reference_direction,
     }
     
     xds.attrs["delay_direction"] = delay_direction
     xds.attrs["phase_direction"] = phase_direction
     xds.attrs["reference_direction"] = reference_direction
     xds.attrs["field_info"] = field_info
+    
+    
 
     ###############################################################
     # Add coordinates
@@ -258,17 +361,12 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
     return xds
 
 
-def add_encoding(xds, compressor):
-    for da_name in list(xds.data_vars):
-        xds[da_name].encoding = {"compressor": compressor}
-
-
 # Reshape a column
 def reshape_column(
-    column_data: np.ndarray,
-    cshape: tuple[int],
-    time_indices: np.ndarray,
-    baselines: np.ndarray,
+    column_data,
+    cshape,
+    time_indices,
+    baselines,
 ):
     # full data is the maximum of the data shape and chunk shape dimensions for each time interval
 
@@ -298,7 +396,7 @@ def get_baselines(MeasurementSet: tables.table) -> np.ndarray:
 
 # Need to convert pairs of antennas into indices
 # Integer indices required for array broadcasting
-def get_baseline_indices(MeasurementSet: tables.table) -> tuple:
+def get_baseline_pairs(MeasurementSet: tables.table) -> tuple:
     # main table uses time x (antenna1,antenna2)
     ant1, ant2 = MeasurementSet.getcol("ANTENNA1", 0, -1), MeasurementSet.getcol(
         "ANTENNA2", 0, -1
@@ -317,9 +415,42 @@ def get_baseline_indices(MeasurementSet: tables.table) -> tuple:
     return (baseline_ant1_id, baseline_ant2_id)
 
 
+
+
+def get_baseline_indices(MeasurementSet: tables.table) -> tuple:
+    # main table uses time x (antenna1,antenna2)
+    ant1, ant2 = MeasurementSet.getcol("ANTENNA1", 0, -1), MeasurementSet.getcol(
+        "ANTENNA2", 0, -1
+    )
+    
+    all_antenna_pairs = antennas_to_indices(ant1, ant2)
+    
+    # pd.unique is much faster than np.unique because it doesn't pre-sort
+    # If len(unique_antenna_pairs) << len(all_antenna_pairs) then this is 
+    # is a greater than 2x speedup
+    unique_antenna_pairs = np.sort(pd.unique(all_antenna_pairs))
+
+    # Compiled searchsort on pre-sorted arrays is ~2x faster than np.searchsorted
+    baseline_indices = searchsorted_nb(unique_antenna_pairs, all_antenna_pairs)
+
+    return baseline_indices
+
+def get_invertible_indices(MeasurementSet: tables.table) -> tuple:
+    # main table uses time x (antenna1,antenna2)
+    ant1, ant2 = MeasurementSet.getcol("ANTENNA1", 0, -1), MeasurementSet.getcol(
+        "ANTENNA2", 0, -1
+    )
+    
+    unique_invertible_indices = np.sort(pd.unique(invertible_indices(ant1, ant2)))
+    
+    return indices_to_baseline_ids(unique_invertible_indices)
+    
+
+
 # Add column metadata for a single column
 # Must be called after the DataArrays have been created
 def create_attribute_metadata(column_name, MeasurementSet):
+    
     attrs_metadata = {}
 
     if column_name in ["U", "V", "W"]:
@@ -372,47 +503,35 @@ def add_time(xds, MeasurementSet):
     xds.time.attrs["integration_time"] = interval
 
     xds.time.attrs["effective_integration_time"] = exposure
+    return
 
 
 def MS_chunk_to_zarr(
     xds,
     infile,
-    time_values,
+    row_indices,
     times,
-    baseline_ant1_id,
-    baseline_ant2_id,
-    column_names,
+    num_unique_baselines,
     outfile,
-    append=False,
+    times_per_chunk,
+    data_variable_columns,
+    column_dimensions,
+    column_to_data_variable_names,
 ):
+    
     # TODO refactor MS loading
     # Loading+querying uses a lot of memory
-    MeasurementSet = tables.table(infile, readonly=True, lockoptions="autonoread")
-    MeasurementSet_chunk = MeasurementSet.selectrows(np.where(np.isin(time_values, times))[0])
-    
-    # Get all baseline pairs
-    antenna1, antenna2 = (
-        MeasurementSet_chunk.getcol("ANTENNA1"),
-        MeasurementSet_chunk.getcol("ANTENNA2"),
-    )
+    with tables.table(infile, readonly=True, lockoptions="autonoread").selectrows(row_indices) as MeasurementSet_chunk:
 
-    # Get dimensions of data
-    time_indices = np.searchsorted(times, MeasurementSet_chunk.getcol("TIME"))
-    data_shape = (len(times), len(baseline_ant1_id))
+        # Get dimensions of data
+        time_indices = searchsorted_nb(times, MeasurementSet_chunk.getcol("TIME"))
+        data_shape = (len(times), num_unique_baselines)
 
-    baseline_combinations = [
-        str(ll[0]).zfill(3) + "_" + str(ll[1]).zfill(3)
-        for ll in np.hstack([antenna1[:, None], antenna2[:, None]])
-    ]
+        baseline_indices = get_baseline_indices(MeasurementSet_chunk)
 
-    baselines = get_baselines(MeasurementSet_chunk)
-
-    baseline_indices = np.searchsorted(baselines, baseline_combinations)
-
-    # Must loop over each column to create an xarray DataArray for each
-    for column_name in column_names:
-        # Only handle certain columns. Others are metadata/coordinates
-        if column_name in data_variable_columns:
+        # Must loop over each column to create an xarray DataArray for each
+        for column_name in data_variable_columns:
+            
             column_data = MeasurementSet_chunk.getcol(column_name)
 
             # UVW column must be split into u, v, and w
@@ -456,97 +575,49 @@ def MS_chunk_to_zarr(
                 # Add the DataArray to the Dataset
                 xds[column_to_data_variable_names.get(column_name)] = xda
 
-    # Add column metadata at the end
-    # Adding metadata to a variable means the variable must already exist
-    if not append:
-        for column_name in column_names:
-            if column_name in data_variable_columns:
-                if column_name == "UVW":
-                    subcolumn_names = ["U", "V", "W"]
+                # Add column metadata at the end
+                # Adding metadata to a variable means the variable must already exist
 
-                    for subcolumn_name in subcolumn_names:
-                        xds[column_to_data_variable_names[subcolumn_name]].attrs.update(
-                            create_attribute_metadata(column_name, MeasurementSet_chunk)
-                        )
-
-                else:
-                    xds[column_to_data_variable_names[column_name]].attrs.update(
-                        create_attribute_metadata(column_name, MeasurementSet_chunk)
+                xds[column_to_data_variable_names[column_name]].attrs.update(
+                    create_attribute_metadata(column_name, MeasurementSet_chunk)
                     )
-
-    # Each time value is a new chunk
-    # Not clear is there's a way to change this behaviour
-    if append:
-        return xds.to_zarr(store=outfile, append_dim="time", compute=True)
-    else:
+            
+        xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
+            
         add_time(xds, MeasurementSet_chunk)
         xds.to_zarr(store=outfile, mode="w", compute=True)
-        return None
+    return
 
 
 def MS_to_zarr_in_memory(
     xds,
     MeasurementSet,
     unique_times,
-    baseline_ant1_id,
-    baseline_ant2_id,
+    num_unique_baselines,
     column_names,
     infile,
     outfile,
-    compress,
-    append,
 ):
-    # Get all baseline pairs
-    antenna1, antenna2 = (
-        MeasurementSet.getcol("ANTENNA1"),
-        MeasurementSet.getcol("ANTENNA2"),
-    )
+
 
     # Get dimensions of data
-    time_indices = np.searchsorted(unique_times, MeasurementSet.getcol("TIME"))
-    data_shape = (len(unique_times), len(baseline_ant1_id))
+    time_indices = searchsorted_nb(unique_times, MeasurementSet.getcol("TIME"))
+    data_shape = (len(unique_times), num_unique_baselines)
 
-    baseline_combinations = [
-        str(ll[0]).zfill(3) + "_" + str(ll[1]).zfill(3)
-        for ll in np.hstack([antenna1[:, None], antenna2[:, None]])
-    ]
-
-    baselines = get_baselines(MeasurementSet)
-
-    baseline_indices = np.searchsorted(baselines, baseline_combinations)
+    baseline_indices = get_baseline_indices(MeasurementSet)
 
     # Must loop over each column to create an xarray DataArray for each
     for column_name in column_names:
-        # Only handle certain columns. Others are metadata/coordinates
-        if column_name in data_variable_columns:
-            column_data = MeasurementSet.getcol(column_name)
+        column_data = MeasurementSet.getcol(column_name)
 
-            # UVW column must be split into u, v, and w
-            if column_name == "UVW":
-                subcolumns = [column_data[:, 0], column_data[:, 1], column_data[:, 2]]
-                subcolumn_names = ["U", "V", "W"]
+        # UVW column must be split into u, v, and w
+        if column_name == "UVW":
+            subcolumns = [column_data[:, 0], column_data[:, 1], column_data[:, 2]]
+            subcolumn_names = ["U", "V", "W"]
 
-                for data, name in zip(subcolumns, subcolumn_names):
-                    reshaped_column = reshape_column(
-                        data,
-                        data_shape,
-                        time_indices,
-                        baseline_indices,
-                    )
-
-                    # Create a DataArray instead of appending immediately to Dataset
-                    # so time coordinates can be updated
-                    xda = xr.DataArray(
-                        reshaped_column,
-                        dims=column_dimensions.get(name),
-                    )
-
-                    # Add the DataArray to the Dataset
-                    xds[column_to_data_variable_names.get(name)] = xda
-
-            else:
+            for data, name in zip(subcolumns, subcolumn_names):
                 reshaped_column = reshape_column(
-                    column_data,
+                    data,
                     data_shape,
                     time_indices,
                     baseline_indices,
@@ -556,33 +627,45 @@ def MS_to_zarr_in_memory(
                 # so time coordinates can be updated
                 xda = xr.DataArray(
                     reshaped_column,
-                    dims=column_dimensions.get(column_name),
+                    dims=column_dimensions.get(name),
                 )
 
                 # Add the DataArray to the Dataset
-                xds[column_to_data_variable_names.get(column_name)] = xda
+                xds[column_to_data_variable_names.get(name)] = xda
+
+        else:
+            reshaped_column = reshape_column(
+                column_data,
+                data_shape,
+                time_indices,
+                baseline_indices,
+            )
+
+            # Create a DataArray instead of appending immediately to Dataset
+            # so time coordinates can be updated
+            xda = xr.DataArray(
+                reshaped_column,
+                dims=column_dimensions.get(column_name),
+            )
+
+            # Add the DataArray to the Dataset
+            xds[column_to_data_variable_names.get(column_name)] = xda
 
     # Add column metadata at the end
     # Adding metadata to a variable means the variable must already exist
-    if not append:
-        for column_name in column_names:
-            if column_name in data_variable_columns:
-                if column_name == "UVW":
-                    subcolumn_names = ["U", "V", "W"]
+    for column_name in column_names:
+        if column_name == "UVW":
+            subcolumn_names = ["U", "V", "W"]
 
-                    for subcolumn_name in subcolumn_names:
-                        xds[column_to_data_variable_names[subcolumn_name]].attrs.update(
-                            create_attribute_metadata(column_name, MeasurementSet)
-                        )
+            for subcolumn_name in subcolumn_names:
+                xds[column_to_data_variable_names[subcolumn_name]].attrs.update(
+                    create_attribute_metadata(column_name, MeasurementSet)
+                )
 
-                else:
-                    xds[column_to_data_variable_names[column_name]].attrs.update(
-                        create_attribute_metadata(column_name, MeasurementSet)
-                    )
-        
-    if compress:
-        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-        add_encoding(xds, compressor)
+        else:
+            xds[column_to_data_variable_names[column_name]].attrs.update(
+                create_attribute_metadata(column_name, MeasurementSet)
+            )
         
     MS_size_MB = get_dir_size(path=infile) / (1024*1024)
     
@@ -600,62 +683,33 @@ def MS_to_zarr_in_memory(
     xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
         
     return xds.to_zarr(store=outfile, mode="w", compute=True)
-    
 
 
-def concatenate_zarr(outfile_tmp, outfiles):
+def concatenate_stores(infile, outfile_tmp, outfiles, times_per_chunk, client):
     
-    xds = xr.open_zarr(outfiles[0])
+    xds = xr.open_mfdataset(paths=outfiles, engine="zarr", parallel=True)
+    xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
     
-    xds.to_zarr(outfile_tmp, mode="w", compute=True, consolidated=True)
+    synchronizer = zarr.ThreadSynchronizer()
     
-    parallel_writes = []
+    parallel_writes = xds.to_zarr(outfile_tmp, mode="w", compute=False, synchronizer=synchronizer, safe_chunks=False)
     
-    for outfile in outfiles[1:]:
-        xds = xr.open_zarr(outfile)
-        parallel_writes.append(xds.to_zarr(outfile_tmp, append_dim="time", compute=False))
-        
-    dask.compute(parallel_writes)
+    future = client.compute(parallel_writes)
+    wait(future)
     
     for outfile in outfiles:
         shutil.rmtree(f"{outfile}")
-
-
-
-# Chunk tuning required for optimal performance
-# Dask recommends at least 100MB chunk sizes
-# https://docs.dask.org/en/latest/array-best-practices.html
-def rechunk(infile, outfile_tmp, outfile, compress, ntimes):
-    xds = xr.open_zarr(outfile_tmp)
-
-    # Manually delete encoding otherwise to_zarr() fails
-    # see https://stackoverflow.com/questions/67476513/zarr-not-respecting-chunk-size-from-xarray-and-reverting-to-original-chunk-size
-    for var in xds:
-        del xds[var].encoding["chunks"]
-
-    # Compression slows down the conversion a lot
-    if compress:
-        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-        add_encoding(xds, compressor)
         
-    MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    return
+
+
+def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
+    # Ensure JIT compilation before multiprocessing pool is spawned
+    searchsorted_nb(np.array([0.,1.]), np.array([0.,1.]))
+    isin_nb(np.array([0.,1.]), np.array([0.,1.]))
+    antennas_to_indices(np.array([0,1]), np.array([1,2]))
     
-    # Ceiling division so that chunks are at least 100MB
-    # Integer casting always returns a smaller number so chunks >100MB
-    n_chunks = MS_size_MB // 100
-
-    # xr's chunk method requires rows_per_chunk as input not n_chunks
-    times_per_chunk = ntimes // n_chunks
     
-    # Chunks method is number of pieces in the chunk
-    # not the number of chunks. -1 gives a single chunk
-    xds = xds.chunk({"time": times_per_chunk, "frequency":-1, "baseline_id":-1, "polarization":-1})
-    xds.to_zarr(outfile, mode="w", compute=True, consolidated=True)
-
-    shutil.rmtree(f"{outfile_tmp}")
-
-
-def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., num_cores=4):
     # Create temporary zarr store
     # Eventually clean-up by rechunking the zarr datastore
     outfile_tmp = outfile + ".tmp"
@@ -670,12 +724,13 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
 
     # Get the unique timestamps
     # TODO pass time values to MS_to_zarr functions to reduce memory footprint
+    # TODO use .col() instead of .getcol() for lazy loading and selecting
     time_values = MeasurementSet.getcol("TIME")
-    flat_time_values = time_values.flatten()
-    unique_time_values = np.unique(flat_time_values)
+    unique_time_values = np.sort(pd.unique(time_values))
 
     # Get unique baseline indices
-    baseline_ant1_id, baseline_ant2_id = get_baseline_indices(MeasurementSet)
+    baseline_ant1_id, baseline_ant2_id = get_invertible_indices(MeasurementSet)
+    num_unique_baselines = len(baseline_ant1_id)
 
     # Base Dataset
     xds_base = xr.Dataset()
@@ -687,19 +742,28 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
     )
 
     column_names = MeasurementSet.colnames()
+    
+    columns_to_convert = []
+    
+    for col_name in column_names:
+        if col_name in data_variable_columns:
+            try:
+                # Check that the column is populated
+                if MeasurementSet.col(col_name)[0] is not None:
+                    columns_to_convert.append(col_name)
+                    
+            except:
+                pass
 
     if fits_in_memory:
         MS_to_zarr_in_memory(
             xds_base,
             MeasurementSet,
             unique_time_values,
-            baseline_ant1_id,
-            baseline_ant2_id,
-            column_names,
+            num_unique_baselines,
+            columns_to_convert,
             infile,
             outfile,
-            compress,
-            append=False,
         )
         
     else:
@@ -708,38 +772,84 @@ def convert(infile, outfile, compress=True, fits_in_memory=False, mem_avail=2., 
         # Halve the total available memory for safety
         # Assumes the numpy arrays take up the same space in memory
         # as the MeasurementSet
-        mem_avail *= 0.5 * 1024.**3 / num_cores
+        mem_avail_per_process = mem_avail * 0.5 * 1024.**3 / num_procs
         MS_size = get_dir_size(infile)
-
-        num_chunks = np.max([MS_size // mem_avail, 2])
         
-
+        num_chunks = np.max([int(MS_size // mem_avail_per_process), num_procs])
+        
         time_chunks = np.array_split(unique_time_values, num_chunks)
-        
+    
+        # Ceiling division so that chunks are at least 100MB
+        # Integer casting always returns a smaller number so chunks >100MB
+        n_chunks = (MS_size / (1024*1024)) // 100
+
+        # xr's chunk method requires rows_per_chunk as input not n_chunks
+        times_per_chunk = len(unique_time_values) // n_chunks
 
         
         outfiles = []
         xds_list = []
+        row_indices_list = []
+        infiles = []
+        antenna_length_list = []
+        column_name_list = []
+        times_per_chunk_list = []
+        data_variables_list = []
+        column_dimension_list = []
+        column_to_variable_list = []
         
         for i, time_chunk in enumerate(time_chunks):
             outfiles.append(outfile_tmp + str(i))
             xds_list.append(xds_base.copy(deep=True))
+            row_indices_list.append(np.where(isin_nb(time_values, time_chunk))[0])
+            infiles.append(deepcopy(infile))
+            antenna_length_list.append(deepcopy(num_unique_baselines))
+            times_per_chunk_list.append(deepcopy(times_per_chunk))
+            data_variables_list.append(deepcopy(columns_to_convert))
+            column_dimension_list.append(deepcopy(column_dimensions))
+            column_to_variable_list.append(deepcopy(column_to_data_variable_names))
+        
+
+        del time_values
+        # Must delete MeasurementSet here (especially for Unix systems)
+        # Prevents multiprocessing from forking MeasurementSet to child processes
+        del MeasurementSet
+        
+        
+        with mp.Pool(processes=num_procs, maxtasksperchild=1) as pool:
             
-        pool = mp.Pool(processes=num_cores)
+            pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
+                                                infiles, 
+                                                row_indices_list,
+                                                time_chunks, 
+                                                antenna_length_list,
+                                                outfiles,
+                                                times_per_chunk_list,
+                                                data_variables_list,
+                                                column_dimension_list,
+                                                column_to_variable_list,
+                                                ),
+                                            chunksize=1,
+                                        )
+            
+        MS_size_MB = get_dir_size(path=infile) / (1024*1024)
+    
+        # Ceiling division so that chunks are at least 100MB
+        # Integer casting always returns a smaller number so chunks >100MB
+        n_chunks = MS_size_MB // 100
         
-        pool.starmap(MS_chunk_to_zarr, zip(xds_list, 
-                                            repeat(infile), 
-                                            repeat(time_values),
-                                            time_chunks, 
-                                            repeat(baseline_ant1_id), 
-                                            repeat(baseline_ant2_id), 
-                                            repeat(column_names),
-                                            outfiles,
-                                            )
-                                    )
+        ntimes = len(unique_time_values)
+
+        # xr's chunk method requires rows_per_chunk as input not n_chunks
+        times_per_chunk = 2 * ntimes // n_chunks
         
-        pool.terminate()
-        
-        concatenate_zarr(outfile_tmp, outfiles)
-                
-        rechunk(infile, outfile_tmp, outfile, compress, ntimes=len(unique_time_values))
+        with LocalCluster(n_workers=1,
+                          processes=False,
+                          threads_per_worker=num_procs,
+                          memory_limit=f"{mem_avail}GiB",
+                        ) as cluster, Client(cluster) as client:
+            
+            concatenate_stores(infile, outfile, outfiles, times_per_chunk, client)
+
+        return
+    
