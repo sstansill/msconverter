@@ -292,7 +292,7 @@ def create_coordinates(xds, MeasurementSet, unique_times, baseline_ant1_id, base
     if code == "":
         code = "1"
         
-    field_id = _check_single_field(MeasurementSet)
+    field_id = MeasurementSet.col("FIELD_ID")[0]
 
     field_info = {
         "name": name,
@@ -482,8 +482,8 @@ def create_attribute_metadata(column_name, MeasurementSet):
 # Separate function to add time attributes. Must happen after the
 # time coordinate is created
 def add_time(xds, MeasurementSet):
-    interval = _check_interval_consistent(MeasurementSet)
-    exposure = _check_exposure_consistent(MeasurementSet)
+    interval = MeasurementSet.col("INTERVAL")[0]
+    exposure = MeasurementSet.col("EXPOSURE")[0]
     time_description = MeasurementSet.getcoldesc("TIME")
 
     xds.time.attrs["type"] = time_description.get("MEASINFO", {}).get("type", "None")
