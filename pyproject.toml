@@ -16,10 +16,8 @@ dependencies = [
 'xarray',
 'dask',
 'distributed',
-'pytest',
 'zarr',
-'numcodecs',
+'python_casacore>=3.5.2; sys_platform != "darwin" ',
 'jupyterlab',
-'tqdm',
-'python_casacore>=3.5.2; sys_platform != "darwin" '
+'gsutil'
 ]

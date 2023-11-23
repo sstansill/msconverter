@@ -87,7 +87,7 @@ data_variable_columns = [
     "FLAG",
     "UVW",
     "TIME_CENTROID",
-    "EXPOSURE",
+    # "EXPOSURE",
     "FLAG_CATEGORY",
     "MODEL_DATA",
     "SIGMA",
@@ -95,9 +95,9 @@ data_variable_columns = [
     "DATA_DESC_ID",
     "FEED1",
     "FEED2",
-    "FIELD_ID",
+    # "FIELD_ID",
     "FLAG_ROW",
-    "INTERVAL",
+    # "INTERVAL",
     "OBSERVATION_ID",
     "PROCESSOR_ID",
     "SCAN_NUMBER",
@@ -115,7 +115,7 @@ column_to_data_variable_names = {
     "FLAG": "FLAG",
     "UVW": "UVW",
     "TIME_CENTROID": "TIME_CENTROID",
-    "EXPOSURE": "EFFECTIVE_INTEGRATION_TIME",
+    # "EXPOSURE": "EFFECTIVE_INTEGRATION_TIME",
     "U": "U",
     "V": "V",
     "W": "W",
@@ -126,9 +126,9 @@ column_to_data_variable_names = {
     "DATA_DESC_ID": "DATA_DESC_ID",
     "FEED1": "FEED1",
     "FEED2": "FEED2",
-    "FIELD_ID": "FIELD_ID",
+    # "FIELD_ID": "FIELD_ID",
     "FLAG_ROW": "FLAG_ROW",
-    "INTERVAL": "INTERVAL",
+    # "INTERVAL": "INTERVAL",
     "OBSERVATION_ID": "OBSERVATION_ID",
     "PROCESSOR_ID": "PROCESSOR_ID",
     "SCAN_NUMBER": "SCAN_NUMBER",
@@ -148,7 +148,7 @@ column_dimensions = {
     "V": ("time", "baseline_id"),
     "W": ("time", "baseline_id"),
     "TIME_CENTROID": ("time", "baseline_id"),
-    "EXPOSURE": ("time", "baseline_id"),
+    # "EXPOSURE": ("time", "baseline_id"),
     "FLOAT_DATA": ("time", "baseline_id", "frequency", "polarization"),
     "FLAG_CATEGORY": ("time", "baseline_id", "frequency", "polarization"),
     "MODEL_DATA": ("time", "baseline_id", "frequency", "polarization"),
@@ -157,9 +157,9 @@ column_dimensions = {
     "DATA_DESC_ID": ("time", "baseline_id"),
     "FEED1": ("time", "baseline_id"),
     "FEED2": ("time", "baseline_id"),
-    "FIELD_ID": ("time", "baseline_id"),
+    # "FIELD_ID": ("time", "baseline_id"),
     "FLAG_ROW": ("time", "baseline_id"),
-    "INTERVAL": ("time", "baseline_id"),
+    # "INTERVAL": ("time", "baseline_id"),
     "OBSERVATION_ID": ("time", "baseline_id"),
     "PROCESSOR_ID": ("time", "baseline_id"),
     "SCAN_NUMBER": ("time", "baseline_id"),
@@ -484,8 +484,17 @@ def create_attribute_metadata(column_name, MeasurementSet):
 # Separate function to add time attributes. Must happen after the
 # time coordinate is created
 def add_time(xds, MeasurementSet):
-    interval = _check_interval_consistent(MeasurementSet)
-    exposure = _check_exposure_consistent(MeasurementSet)
+    try:
+        interval = MeasurementSet.col("INTERVAL")[0]
+    except:
+        interval = "None"
+    
+    try:
+        exposure = MeasurementSet.col("EXPOSURE")[0]
+    except:
+        exposure = "None"
+    
+    
     time_description = MeasurementSet.getcoldesc("TIME")
 
     xds.time.attrs["type"] = time_description.get("MEASINFO", {}).get("type", "None")
@@ -500,9 +509,9 @@ def add_time(xds, MeasurementSet):
         time_description.get("keywords", {}).get("MEASINFO", {}).get("Ref", "None")
     )
 
-    xds.time.attrs["integration_time"] = interval
+    xds.time.attrs["interval"] = interval
 
-    xds.time.attrs["effective_integration_time"] = exposure
+    xds.time.attrs["exposure"] = exposure
     return
 
 
@@ -723,7 +732,6 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
     field_id = _check_single_field(MeasurementSet)
 
     # Get the unique timestamps
-    # TODO pass time values to MS_to_zarr functions to reduce memory footprint
     # TODO use .col() instead of .getcol() for lazy loading and selecting
     time_values = MeasurementSet.getcol("TIME")
     unique_time_values = np.sort(pd.unique(time_values))
@@ -745,6 +753,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
     
     columns_to_convert = []
     
+    # Only convert columns which are populated
     for col_name in column_names:
         if col_name in data_variable_columns:
             try:
@@ -754,7 +763,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
                     
             except:
                 pass
-
+    
     if fits_in_memory:
         MS_to_zarr_in_memory(
             xds_base,
@@ -765,7 +774,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
             infile,
             outfile,
         )
-        
+    
     else:
         # Do not delete MeasurementSet from memory, otherwise must reload from disk rather than copied in memory
         
@@ -779,7 +788,7 @@ def convert(infile, outfile, fits_in_memory=False, mem_avail=2., num_procs=4):
         
         time_chunks = np.array_split(unique_time_values, num_chunks)
     
-        # Ceiling division so that chunks are at least 100MB
+        # Ceiling division so that visibility chunks are at least 100MB
         # Integer casting always returns a smaller number so chunks >100MB
         n_chunks = (MS_size / (1024*1024)) // 100
 
