@@ -506,9 +506,9 @@ def add_time(xds, MeasurementSet):
         time_description.get("keywords", {}).get("MEASINFO", {}).get("Ref", "None")
     )
 
-    xds.time.attrs["integration_time"] = interval
+    xds.time.attrs["interval"] = interval
 
-    xds.time.attrs["effective_integration_time"] = exposure
+    xds.time.attrs["exposure"] = exposure
     return
 
 
